@@ -1,0 +1,680 @@
+---
+title: "snRNA_cellchat_analysis"
+format: html
+editor: source
+---
+
+```{r}
+library(CellChat)
+library(patchwork)
+library(tidyverse)
+library(qs)
+library(Seurat)
+library(cowplot)
+library(scCustomize)
+library(proxy)
+library(ggdendro)
+library(ComplexHeatmap)
+library(scales)
+options(stringsAsFactors = FALSE)
+
+```
+
+```{r}
+positions = c("ra", "hvc")
+sn_input_dir = "~/nest_common/sc_datasets/colquitt_2021/"
+sn_input_file = file.path(sn_input_dir, "HVC_RA_paper.qs")
+
+
+out_prefix = "~/nest/rstudio/neuropeptide/snRNA/"
+script_name = "snRNA-2021_cellchat_analysis"
+out_dir = file.path(out_prefix, script_name)
+dir.create(out_dir)
+```
+
+## Import snRNA
+
+```{r}
+obj = qread(sn_input_file)
+objs_p = map(positions, function(p) {
+  subset(obj, subset=position2==p)
+})
+names(objs_p) = positions
+```
+
+Filter
+
+```{r}
+objs_p = map(objs_p, function(obj1) {
+  table_c = table(obj1$cluster_int_sub2)
+  table_c = table_c[table_c>=20]
+  subset(obj1, subset=cluster_int_sub2 %in% names(table_c))
+})
+```
+
+## Import neuropeptide list
+
+```{r}
+nps = read_delim("~/nest/gene_lists/neuropeptide_related_genes.txt")
+```
+
+## Create CellChat obj
+
+```{r}
+ct_order = list(
+  ra = c("RA_Glut-1", "RA_Glut-2", "RA_Glut-3", "GABA-1-1", "GABA-1-2", "GABA-2", "GABA-3", "GABA-4", "GABA-5-1", "GABA-5-2", 'GABA-5-3', "GABA-6", "GABA-7", "GABA-8", "Astro", "Oligo", "OPC", "Micro", "Endo", "Mural", "VLMC", "RBC"),
+  hvc = c("HVC_Glut-1", "HVC_Glut-2", "HVC_Glut-3", "HVC_Glut-4", "HVC_Glut-5", "Pre-4", "Pre-3", "Pre-2", "Pre-1", "GABA-1-1", "GABA-1-2", "GABA-2", "GABA-3", "GABA-4", "GABA-5-1", "GABA-5-2", "GABA-5-3", "GABA-6", "GABA-7", "GABA-8", "GABA-Pre", "Astro", "Epen", "Oligo", "OPC", "Micro", "Endo", "Mural", "VLMC", "RBC"))
+```
+
+```{r}
+cellchats = map(names(objs_p), function(p) {
+  obj1 = objs_p[[p]]
+  Idents(obj1) = factor(obj1$cluster_int_sub2, levels=ct_order[[p]])
+  Idents(obj1) = droplevels(Idents(obj1))
+  #obj1$samples = obj1$assignment
+  createCellChat(object = obj1, group.by = "ident", assay = "SCT")
+}) %>% set_names(names(objs_p))
+```
+
+```{r}
+CellChatDB <- CellChatDB.human # use CellChatDB.mouse if running on mouse data
+showDatabaseCategory(CellChatDB)
+
+gi = CellChatDB$geneInfo
+int = CellChatDB$interaction
+
+CellChatDB.use = subsetDB(CellChatDB)
+
+cellchats = map(cellchats, function(cellchat) {
+cellchat@DB = CellChatDB.use
+cellchat
+})
+```
+
+## Define neuropeptide pathways
+
+```{r}
+nps_pattern = nps %>% mutate(SYMBOL = paste0("^", SYMBOL))
+pattern = paste(nps_pattern$SYMBOL, collapse="|")
+db = cellchats[[1]]@DB$interaction
+
+db_nps = db %>% filter(grepl(pattern, interaction_name)) 
+
+```
+
+```{r}
+future::plan("multisession", workers = 1) # do parallel
+cellchats = map(cellchats, function(cellchat) {
+  cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+  cellchat <- identifyOverExpressedGenes(cellchat)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat
+})
+```
+
+```{r}
+walk(cellchats, function(cellchat) {
+print(computeAveExpr(cellchat, features = c("CRH", "CRHR2", "SST"), type =  "truncatedMean", trim = 0.05))
+})
+```
+
+})
+
+```{r}
+#future::plan("multisession", workers = 36) # do parallel
+
+cellchats_communProb_fname = file.path(out_dir, "cellchats_communProb.rds")
+redo = F
+if (redo) {
+  ptm = Sys.time()
+  plan("multisession", workers=1)
+  cellchats = map(cellchats, function(cellchat) {
+    cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.05, population.size = T)
+    execution.time = Sys.time() - ptm
+    print(as.numeric(execution.time, units = "secs"))
+    cellchat
+  })
+  saveRDS(cellchats, cellchats_communProb_fname)
+} else {
+  cellchats = readRDS(cellchats_communProb_fname)
+}
+```
+
+```{r}
+cellchats = map(cellchats, function(cellchat) { 
+  cellchat = filterCommunication(cellchat, min.cells = 10)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat 
+})
+```
+
+## Cell-cell interactions
+
+```{r}
+df.nets <- map(cellchats, function(cellchat) {
+  subsetCommunication(cellchat)
+})
+```
+
+```{r}
+
+df.netP = map(cellchats, function(cellchat) { 
+  subsetCommunication(cellchat, slot.name = "netP")
+})
+```
+
+```{r}
+cellchats = map(cellchats, function(cellchat) {
+    aggregateNet(cellchat)
+})
+walk(cellchats, function(cellchat) {
+
+
+  groupSize <- as.numeric(table(cellchat@idents))
+  par(mfrow = c(1,2), xpd=TRUE)
+  netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+  netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+})
+```
+
+```{r}
+netVisual_heatmap_custom = function (object, comparison = c(1, 2), measure = c("count", 
+    "weight"), signaling = NULL, slot.name = c("netP", "net"), 
+    color.use = NULL, color.heatmap = NULL, title.name = NULL, 
+    width = NULL, height = NULL, font.size = 8, font.size.title = 10, 
+    cluster.rows = FALSE, cluster.cols = FALSE, sources.use = NULL, 
+    targets.use = NULL, remove.isolate = FALSE, row.show = NULL, 
+    col.show = NULL) 
+{
+    if (!is.null(measure)) {
+        measure <- match.arg(measure)
+    }
+    slot.name <- match.arg(slot.name)
+    if (is.list(object@net[[1]])) {
+        message("Do heatmap based on a merged object \n")
+        if (is.null(color.heatmap)) {
+            color.heatmap <- c("#2166ac", "#b2182b")
+        }
+        obj1 <- object@net[[comparison[1]]][[measure]]
+        obj2 <- object@net[[comparison[2]]][[measure]]
+        net.diff <- obj2 - obj1
+        if (measure == "count") {
+            if (is.null(title.name)) {
+                title.name = "Differential number of interactions"
+            }
+        }
+        else if (measure == "weight") {
+            if (is.null(title.name)) {
+                title.name = "Differential interaction strength"
+            }
+        }
+        legend.name = "Relative values"
+    }
+    else {
+        message("Do heatmap based on a single object \n")
+        if (is.null(color.heatmap)) {
+            color.heatmap <- "Reds"
+        }
+        if (!is.null(signaling)) {
+            net.diff <- slot(object, slot.name)$prob[, , signaling]
+            if (is.null(title.name)) {
+                title.name = paste0(signaling, " signaling network")
+            }
+            legend.name <- "Communication Prob."
+        }
+        else if (!is.null(measure)) {
+            net.diff <- object@net[[measure]]
+            if (measure == "count") {
+                if (is.null(title.name)) {
+                  title.name = "Number of interactions"
+                }
+            }
+            else if (measure == "weight") {
+                if (is.null(title.name)) {
+                  title.name = "Interaction strength"
+                }
+            }
+            legend.name <- title.name
+        }
+    }
+    net <- net.diff
+    if ((!is.null(sources.use)) | (!is.null(targets.use))) {
+        df.net <- reshape2::melt(net, value.name = "value")
+        colnames(df.net)[1:2] <- c("source", "target")
+        if (!is.null(sources.use)) {
+            if (is.numeric(sources.use)) {
+                sources.use <- rownames(net.diff)[sources.use]
+            }
+            df.net <- subset(df.net, source %in% sources.use)
+        }
+        if (!is.null(targets.use)) {
+            if (is.numeric(targets.use)) {
+                targets.use <- rownames(net.diff)[targets.use]
+            }
+            df.net <- subset(df.net, target %in% targets.use)
+        }
+        cells.level <- rownames(net.diff)
+        df.net$source <- factor(df.net$source, levels = cells.level)
+        df.net$target <- factor(df.net$target, levels = cells.level)
+        df.net$value[is.na(df.net$value)] <- 0
+        net <- tapply(df.net[["value"]], list(df.net[["source"]], 
+            df.net[["target"]]), sum)
+    }
+    net[is.na(net)] <- 0
+    if (is.null(color.use)) {
+        color.use <- scPalette(ncol(net))
+    }
+    names(color.use) <- colnames(net)
+    color.use.row <- color.use
+    color.use.col <- color.use
+    if (remove.isolate) {
+        idx1 <- which(Matrix::rowSums(net) == 0)
+        idx2 <- which(Matrix::colSums(net) == 0)
+        if (length(idx1) > 0) {
+            net <- net[-idx1, ]
+            color.use.row <- color.use.row[-idx1]
+        }
+        if (length(idx2) > 0) {
+            net <- net[, -idx2]
+            color.use.col <- color.use.col[-idx2]
+        }
+    }
+    mat <- net
+    if (!is.null(row.show)) {
+        mat <- mat[row.show, ]
+        color.use.row <- color.use.row[row.show]
+    }
+    if (!is.null(col.show)) {
+        mat <- mat[, col.show]
+        color.use.col <- color.use.col[col.show]
+    }
+    if (min(mat) < 0) {
+        color.heatmap.use = colorRamp3(c(min(mat), 0, max(mat)), 
+            c(color.heatmap[1], "#f7f7f7", color.heatmap[2]))
+        colorbar.break <- c(round(min(mat, na.rm = T), digits = nchar(sub(".*\\.(0*).*", 
+            "\\1", min(mat, na.rm = T))) + 1), 0, round(max(mat, 
+            na.rm = T), digits = nchar(sub(".*\\.(0*).*", "\\1", 
+            max(mat, na.rm = T))) + 1))
+    }
+    else {
+        if (length(color.heatmap) == 3) {
+            color.heatmap.use = colorRamp3(c(0, min(mat), max(mat)), 
+                color.heatmap)
+        }
+        else if (length(color.heatmap) == 2) {
+            color.heatmap.use = colorRamp3(c(min(mat), max(mat)), 
+                color.heatmap)
+        }
+        else if (length(color.heatmap) == 1) {
+            color.heatmap.use = (grDevices::colorRampPalette((RColorBrewer::brewer.pal(n = 9, 
+                name = color.heatmap))))(100)
+        }
+        colorbar.break <- c(round(min(mat, na.rm = T), digits = nchar(sub(".*\\.(0*).*", 
+            "\\1", min(mat, na.rm = T))) + 1), round(max(mat, 
+            na.rm = T), digits = nchar(sub(".*\\.(0*).*", "\\1", 
+            max(mat, na.rm = T))) + 1))
+    }
+    df.col <- data.frame(group = colnames(mat))
+    rownames(df.col) <- colnames(mat)
+    df.row <- data.frame(group = rownames(mat))
+    rownames(df.row) <- rownames(mat)
+    col_annotation <- HeatmapAnnotation(df = df.col, col = list(group = color.use.col), 
+        which = "column", show_legend = FALSE, show_annotation_name = FALSE, 
+        simple_anno_size = grid::unit(0.2, "cm"))
+    row_annotation <- HeatmapAnnotation(df = df.row, col = list(group = color.use.row), 
+        which = "row", show_legend = FALSE, show_annotation_name = FALSE, 
+        simple_anno_size = grid::unit(0.2, "cm"))
+    ha1 = rowAnnotation(Strength = anno_barplot(rowSums(abs(mat)),
+                                                width = unit(width * .1, "in"),
+                                                border = FALSE, 
+                                                gp = gpar(fill = color.use.row, col = color.use.row),
+                                                axis_param = list(gp=gpar(fontsize=6))
+                                                ), 
+        show_annotation_name = FALSE)
+    ha2 = HeatmapAnnotation(Strength = anno_barplot(colSums(abs(mat)), 
+                                                    height = unit(height * .1, "in"),
+                                                    border = FALSE, 
+                                                    gp = gpar(fill = color.use.col, col = color.use.col),
+                                                    axis_param = list(gp=gpar(fontsize=6))
+                                                    ), 
+        show_annotation_name = FALSE)
+    if (sum(abs(mat) > 0) == 1) {
+        color.heatmap.use = c("white", color.heatmap.use)
+    }
+    else {
+        mat[mat == 0] <- NA
+    }
+    ht1 = Heatmap(mat, col = color.heatmap.use, na_col = "white", width = unit(width, "in"),
+                  height = unit(height, "in"),
+        name = legend.name, bottom_annotation = col_annotation, 
+        left_annotation = row_annotation, top_annotation = ha2, 
+        right_annotation = ha1, cluster_rows = cluster.rows, 
+        cluster_columns = cluster.rows, row_names_side = "left", 
+        row_names_rot = 0, row_names_gp = gpar(fontsize = font.size), 
+        column_names_gp = gpar(fontsize = font.size), column_title = title.name, 
+        column_title_gp = gpar(fontsize = font.size.title), column_names_rot = 90, 
+        row_title = "Sources (Sender)", row_title_gp = gpar(fontsize = font.size.title), 
+        row_title_rot = 90, heatmap_legend_param = list(title_gp = gpar(fontsize = 8, 
+            fontface = "plain"), title_position = "leftcenter-rot", 
+            border = NA, legend_height = unit(20, "mm"), labels_gp = gpar(fontsize = 8), 
+            grid_width = unit(2, "mm")))
+    return(ht1)
+}
+```
+
+### Pathways separate
+
+```{r}
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  pathway_nps = intersect(db_nps$pathway_name, cellchat@netP$pathways)
+  ncelltypes = length(levels(cellchat@idents))
+  # Hierarchy plot
+  # Here we define `vertex.receive` so that the left portion of the hierarchy plot shows signaling to fibroblast and the right portion shows signaling to immune cells 
+  #vertex.receiver = seq(1, 4) # a numeric vector. 
+  #netVisual_aggregate(cellchat, signaling = pathways.show,  vertex.receiver = vertex.receiver)
+  # Circle plot
+  #par(mfrow=c(1,1))
+  #netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle", vertex.receiver = vertex.receiver)
+  #par(mfrow=c(1,1))
+  #netVisual_aggregate(cellchat, signaling = pathways.show, layout = "chord", vertex.receiver = vertex.receiver)
+  #par(mfrow=c(1,1))
+  height = ncelltypes / 12
+  width = height
+  walk(pathway_nps, function(pathway_cur) {
+    pdf(file.path(out_dir, sprintf("cell-cell_nps_%s_%s.pdf", pathway_cur, p)), height = height+2, width = width+2)
+    hm = netVisual_heatmap_custom(cellchat, signaling = pathway_cur, color.heatmap = "Reds", 
+                           height = height,
+                           width = width, 
+                           font.size = 6
+    )
+    print(hm)
+    dev.off()
+  })
+})
+```
+
+### All pathways
+
+```{r}
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  pathway_nps = intersect(db_nps$pathway_name, cellchat@netP$pathways)
+  ncelltypes = length(levels(cellchat@idents))
+  mats = map(pathway_nps, function(path_cur) {
+    cellchat@netP$prob[,,path_cur]
+  })
+  mats_red = Reduce('+', mats)
+  
+  ncols = 9
+  col = colorRamp3(seq(0, max(mats_red), length.out=ncols ), brewer_pal(palette = "Greys")(ncols))
+  
+  height = ncelltypes / 12
+  width = height * ncol(mats_red) / nrow(mats_red)
+  hm = Heatmap(mats_red, cluster_columns = F, cluster_rows = F, col = col, height = unit(height, "in"), 
+               width = unit(width, "in"),
+               row_names_gp = gpar(fontsize = 6),
+               column_names_gp = gpar(fontsize = 6)
+               )
+  print(hm)
+  pdf(file.path(out_dir, sprintf("cell-cell_nps_%s.pdf", p)), height = height + 2, width = width + 2)
+  print(hm)
+  dev.off()
+  
+  
+})
+```
+
+## Contribution of pathways
+```{r}
+object = cellchats[[p]]
+  pathways.show = db_nps %>% distinct(pathway_name) %>% unlist()
+  signaling = intersect(pathways.show, cellchat@netP$pathways)
+  signaling.name = NULL
+  sources.use = NULL 
+  targets.use = NULL
+  width = 0.1 
+  thresh = 0.05
+  vertex.receiver = NULL
+pairLR <- searchPair(signaling = signaling, pairLR.use = object@LR$LRsig, 
+        key = "pathway_name", matching.exact = T, pair.only = T)
+    pair.name.use = select(object@DB$interaction[rownames(pairLR), 
+        ], "interaction_name_2")
+    if (is.null(signaling.name)) {
+        signaling.name <- signaling
+    }
+net <- object@net
+    pairLR.use.name <- dimnames(net$prob)[[3]]
+    pairLR.name <- intersect(rownames(pairLR), pairLR.use.name)
+    pairLR <- pairLR[pairLR.name, ]
+    prob <- net$prob
+    pval <- net$pval
+    prob[pval > thresh] <- 0
+    if (!is.null(sources.use)) {
+        if (is.character(sources.use)) {
+            if (all(sources.use %in% dimnames(prob)[[1]])) {
+                sources.use <- match(sources.use, dimnames(prob)[[1]])
+            }
+            else {
+                stop("The input `sources.use` should be cell group names or a numerical vector!")
+            }
+        }
+        idx.t <- setdiff(1:nrow(prob), sources.use)
+        prob[idx.t, , ] <- 0
+    }
+    if (!is.null(targets.use)) {
+        if (is.character(targets.use)) {
+            if (all(targets.use %in% dimnames(prob)[[1]])) {
+                targets.use <- match(targets.use, dimnames(prob)[[2]])
+            }
+            else {
+                stop("The input `targets.use` should be cell group names or a numerical vector!")
+            }
+        }
+        idx.t <- setdiff(1:nrow(prob), targets.use)
+        prob[, idx.t, ] <- 0
+    }
+    if (length(pairLR.name) > 1) {
+        pairLR.name.use <- pairLR.name[apply(prob[, , pairLR.name], 
+            3, sum) != 0]
+    } else {
+        pairLR.name.use <- pairLR.name[sum(prob[, , pairLR.name]) != 0]
+    }
+    if (length(pairLR.name.use) == 0) {
+        stop(paste0("There is no significant communication of ", 
+            signaling.name))
+    } else {
+        pairLR <- pairLR[pairLR.name.use, ]
+    }
+    prob <- prob[, , pairLR.name.use]
+    if (length(dim(prob)) == 2) {
+        prob <- replicate(1, prob, simplify = "array")
+        dimnames(prob)[3] <- pairLR.name.use
+    }
+    prob <- (prob - min(prob))/(max(prob) - min(prob))
+    if (is.null(vertex.receiver)) {
+        pSum <- apply(prob, 3, sum)
+        pSum.max <- sum(prob)
+        pSum <- pSum/pSum.max
+        pSum[is.na(pSum)] <- 0
+        y.lim <- max(pSum)
+        pair.name <- unlist(dimnames(prob)[3])
+        pair.name <- factor(pair.name, levels = unique(pair.name))
+        if (!is.null(pairLR.name.use)) {
+            pair.name <- pair.name.use[as.character(pair.name), 
+                1]
+            pair.name <- factor(pair.name, levels = unique(pair.name))
+        }
+        mat <- pSum
+        df1 <- data.frame(name = pair.name, contribution = mat)
+    }
+```
+
+### NPs
+
+```{r}
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  pathways.show = db_nps %>% distinct(pathway_name) %>% unlist()
+  pathways.show = intersect(pathways.show, cellchat@netP$pathways)
+  
+  dat_cur = netAnalysis_contribution(cellchat, signaling = pathways.show, return.data=T)
+  gg = dat_cur$gg.obj + 
+   # scale_y_continuous(n.breaks=3) + 
+    theme(axis.text.x = element_text(size=6),
+          axis.text.y = element_text(size=6),
+          axis.title = element_blank(),
+          plot.title = element_blank(),
+          axis.line = element_line(linewidth=0.25)) +
+    labs(title="")
+  print(gg)
+  
+  pdf(file.path(out_dir, sprintf("contribution_%s.pdf", p)), height=2.5, width=2)
+  print(gg)
+  dev.off()
+
+
+  pairLR.nps <- extractEnrichedLR(cellchat, signaling = pathways.show, geneLR.return = FALSE)
+  
+  for (i in 1:nrow(pairLR.nps)) {
+    LR.show <- pairLR.nps[i,] # show one ligand-receptor pair
+    # Hierarchy plot
+    #vertex.receiver = c(5) # a numeric vector
+    #netVisual_individual(cellchat, signaling = pathways.show,  pairLR.use = LR.show, vertex.receiver = vertex.receiver)
+    #> [[1]]
+    # Circle plot
+    pdf(file.path(out_dir, paste0(LR.show, sprintf("_L-R_contribution_%s.pdf", p))), width = 6, height = 6)
+    print(netVisual_individual(cellchat, signaling = pathways.show, pairLR.use = LR.show, layout = "circle", top = 1E-2, arrow.size=1, arrow.width=2, edge.width.max = 4))
+    dev.off()
+  }
+})
+```
+
+### All
+
+```{r}
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  #pathways.show = db_nps %>% distinct(pathway_name) %>% unlist()
+  pathways.show = cellchat@netP$pathways
+  
+  pdf(file.path(out_dir, sprintf("contribution_all_%s.pdf", p)), height=4, width=3)
+  print(netAnalysis_contribution(cellchat, signaling = pathways.show))
+  dev.off()
+
+
+  pairLR.nps <- extractEnrichedLR(cellchat, signaling = pathways.show, geneLR.return = FALSE)
+  
+  for (i in 1:nrow(pairLR.nps)) {
+    LR.show <- pairLR.nps[i,] # show one ligand-receptor pair
+    # Hierarchy plot
+    #vertex.receiver = c(5) # a numeric vector
+    #netVisual_individual(cellchat, signaling = pathways.show,  pairLR.use = LR.show, vertex.receiver = vertex.receiver)
+    #> [[1]]
+    # Circle plot
+    pdf(file.path(out_dir, paste0(LR.show, sprintf("_all_L-R_contribution_%s.pdf", p))), width = 6, height = 6)
+    print(netVisual_individual(cellchat, signaling = pathways.show, pairLR.use = LR.show, layout = "circle", top = 1E-2, arrow.size=1, arrow.width=2, edge.width.max = 4))
+    dev.off()
+  }
+})
+```
+
+## Signaling component expression
+
+```{r}
+pathway_cur = "SOMATOSTATIN"
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  pdf(file.path(out_dir, sprintf("geneExpression_%s_%s.pdf", pathway_cur, p)))
+  print(plotGeneExpression(cellchat, signaling = pathway_cur, enriched.only = TRUE, type = "violin"))
+  dev.off()
+})
+```
+
+## Network statistics
+
+```{r}
+
+cellchats = map(cellchats, function(cellchat) {
+  netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+})
+
+pathway_cur = "SOMATOSTATIN"
+walk(names(cellchats), function(p) {
+  cellchat = cellchats[[p]]
+  # the slot 'netP' means the inferred intercellular communication network of signaling pathways
+  # Visualize the computed centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
+  
+  pdf(file.path(out_dir, sprintf("signalingRole_%s_%s.pdf", pathway_cur, p)))
+  netAnalysis_signalingRole_network(cellchat, signaling = pathway_cur, width = 8, height = 2.5, font.size = 10)
+  dev.off()
+})
+```
+
+\`
+
+```{r}
+walk(names(cellchats), function(p) {
+  
+  cellchat = cellchats[[p]]
+  # Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+  gg1 <- netAnalysis_signalingRole_scatter(cellchat)
+  gg1
+  #> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+  
+  to_plot = c("NPY", "SOMATOSTATIN", "CRH", "OPIOID", "NTS", "PACAP")
+  walk(to_plot, function(tp) {
+    # Signaling role analysis on the cell-cell communication networks of interest
+    gg2 <- netAnalysis_signalingRole_scatter(cellchat, signaling = tp )
+    save_plot(file.path(out_dir, sprintf("signalingRole_scatter_%s_%s.pdf", tp, p)), gg2, base_height=3, base_width=4)
+  })
+})
+```
+
+```{r}
+# Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+# ht1 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", )
+# ht2 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming")
+# ht1 + ht2
+```
+
+## Plot expression
+
+```{r}
+db_nps_cur = db %>% select(ligand.symbol, receptor.symbol, is_neurotransmitter) %>% 
+  mutate(receptor.symbol_l = map(receptor.symbol, ~unlist(str_split(.x, ", ")))) %>%
+  unnest(receptor.symbol_l)
+db_nps_cur = unique(c(db_nps_cur$ligand.symbol, db_nps_cur$receptor.symbol_l))
+  
+nps_filt = nps %>% filter((SYMBOL %in% db_nps_cur | SYMBOL=="CRHBP")) 
+```
+
+```{r}
+p = "ra"
+
+walk(names(objs_p), function(p) {
+  obj_cur = objs_p[[p]]
+  DefaultAssay(obj_cur) = "SCT"
+  Idents(obj_cur) = factor(obj_cur$cluster_int_sub2, levels=ct_order[[p]])
+  to_plot = intersect(rownames(obj_cur), nps_filt$SYMBOL)
+  
+  mat = as.matrix(log1p(AverageExpression(obj_cur, assay="SCT", group.by="cluster_int_sub2", features=to_plot)[[1]]))
+  mat_max = apply(mat, 1, max)
+  plot(density(mat_max))
+  mat = mat[mat_max>.2,]
+  hc = hclust(dist(mat, method="correlation"), method = "ward.D")
+  dd = dendro_data(hc)
+  gg = ggdendrogram(dd)
+  save_plot(file.path(out_dir, sprintf("nps_expression_dendro_%s.pdf", p)), gg)
+  to_plot_ordered = hc$labels[hc$order]
+  gg = DotPlot_scCustom(obj_cur, features=to_plot_ordered, flip_axes = T, x_lab_rotate = T)
+  gg
+  
+  nclusters = length(unique(Idents(obj_cur)))
+  nfeatures = nrow(mat)
+  
+  height = nfeatures * .25
+  width = nclusters * .3 + 2
+  save_plot(file.path(out_dir, sprintf("nps_epxression_%s.pdf", p)), gg, base_height=height, base_width=width)
+})
+```

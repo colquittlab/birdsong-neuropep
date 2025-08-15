@@ -1,0 +1,438 @@
+````{r}
+library(tidyverse)
+library(qs)
+
+#library(WGCNA) # load before reshape2, as depends on reshape
+library(data.table)
+library(reshape2)
+library(gridExtra)
+
+library(Seurat)
+library(stringr)
+library(broom)
+
+source("~/nest/rstudio/utils/colors.R")
+
+source("~/nest/rstudio/utils/db.R")
+source("~/nest/rstudio/utils/stats.R")
+
+source("~/nest/rstudio/utils/common_aesthetics.R")
+source("~/nest/rstudio/utils/gene_lists.R")
+library(viridis)
+library(RColorBrewer)
+library(lazyeval)
+
+library(ggrepel)
+
+library(cowplot)
+library(ComplexHeatmap)
+library(future)
+
+```
+
+```{r}
+#filter = dplyr::filter
+#select = dplyr::select
+#rename = dplyr::rename
+```
+
+## Set up dir
+```{r}
+prefix_song = "~/nest/rstudio/singing/song_analysis"
+prefix = "~/nest/rstudio/neuropeptide/SLCR"
+root_dir = "deaf_bus_trimmed_merge_3p_seurat_lman-filter_prep"
+data_dir = file.path(prefix, root_dir)
+script_name = "deaf_bus_trimmed_merge_3p_seurat_lman-filter_point-expression_npp"
+out_dir = file.path(data_dir, script_name)
+dir.create(out_dir, recursive = T)
+data_fname = file.path(data_dir, "seurat_object.qs")
+
+deg_dir = "01-deaf_bus_trimmed_merge_3p_seurat_lman-filter_song-nonsong_frac-mito_block-tags_with-sva_gene-filt"
+deg_res = file.path(data_dir, deg_dir, "sv2", "surround_relative", "model_results.qs")
+```
+
+## Load metadata
+
+```{r}
+info_db = "combined.db"
+info_table = "db_info_combined_curated"
+info = load_umi_info(info_db, info_table)
+```
+
+```{r}
+info$position = factor(info$position, 
+                       levels=position_levels)
+
+info = info %>% 
+  mutate(procedure2 = if_else(experiment=="topography", "intact", procedure2)) %>%
+  mutate(is_lesion_side = as.logical(is_lesion_side)) %>%
+  mutate(is_lesion_side = if_else(experiment!="ulman", FALSE, is_lesion_side))
+
+info = info %>% mutate(section_area = if_else(is.na(section_area), 200L, section_area))
+```
+
+## Filter samples
+```{r}
+info = info %>% filter(experiment %in% c("deafening")) 
+```
+
+```{r}
+info %>% select(tags, procedure2) %>% table()  
+info %>% select(tags, is_lesion_side) %>% table()
+```
+
+```{r}
+info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+#info2 = droplevels(info %>% filter(!is.na(songsystem)))
+```
+
+## Load neuropeptide genes
+```{r}
+nps = read_delim("~/nest/gene_lists/neuropeptide_related_genes.txt")
+```
+
+
+## Load seq data
+```{r}
+obj = qread(data_fname)
+info2 = info2 %>% filter(id %in% Cells(obj))
+info2 = as.data.frame(info2)
+rownames(info2) = info2$id
+obj = obj[,Cells(obj) %in% info2$id]
+obj = AddMetaData(obj, info2)
+```
+
+```{r}
+# 
+# npps = list(CRH = c("CRH", "CRHBP", "CRHR1", "CRHR2"),
+#             ADCYAP1 = c("ADCYAP1", "ADCYAP1R1", "VIPR1"),
+#             CCK = c("CCK", "CCKBR"),
+#             NPY = c("NPY", "NPY1R", "NPY2R", "NPY5R"),
+#             PYDN = c("PYDN", "OPKR1"),
+#             PENK = c("PENK", "OPRD1", "OPRM1"),
+#             PNOC = c("PNOC", "OPRL1"),
+#             SST = c("SST", "SSTR1", "SSTR2", "SSTR3", "SSTR4", "SSTR5"),
+#             TAC1 = c("TAC1", "TACR1", "TACR2"),
+#             TAC3 = c("TAC3", "TACR2", "TACR3"),
+#             VIP = c("VIPR1", "VIPR2", "ADCYAP1R1", "VIP")
+#             )
+#to_plot = unique(unlist(npps))
+#to_plot = unique(c(nps, nprs))
+to_plot = nps$SYMBOL
+var_to_plot = c("position", "tags", "procedure2")
+DefaultAssay(obj) = "combat_id2"
+df = FetchData(obj, c(to_plot), slot="data") %>%
+  as.data.frame() %>%
+  rownames_to_column(var="id") %>%
+  pivot_longer(cols=-id, names_to="gene_id", values_to="value") %>%
+  mutate(id = as.numeric(id)) %>% 
+  left_join(info2 %>% select(id, position, procedure2, tags)) %>%
+  mutate(position = factor(position, levels=position_levels),
+         gene_id = factor(gene_id, levels=to_plot)) #%>%
+
+df_id = df %>% distinct(id, position) %>%
+  arrange(position) 
+id_levels = df_id$id
+
+df = df %>%
+  mutate(id = factor(id, levels=id_levels))
+```
+
+Just intact
+```{r}
+# Just intact
+df = df %>% filter(procedure2=="intact") 
+
+# > 2 samples
+df_n = df %>% filter(gene_id == "CRHBP") %>%
+  group_by(position, tags) %>%
+  summarize(n=n()) %>%
+  filter(n>2)
+
+df = df %>% 
+  inner_join(df_n)
+
+df_sum = df  %>% 
+  group_by(gene_id, position) %>%
+  summarize(value_mean = mean(value)) %>% 
+   mutate(songsystem = if_else(position %in% c("ra", "hvc", "lman", "x"), TRUE, FALSE),
+         position2 = case_when(position %in% c("ra", "arco") ~ "ra",
+                               position %in% c("hvc", "ncl") ~ "hvc",
+                               position %in% c("lman", "nido") ~ "lman",
+                               position %in% c("x", "stri") ~ "x")) 
+
+df_sum = df_sum %>% ungroup() %>%
+  group_by(gene_id, position2) %>%
+  mutate(value_mean_rel = value_mean[songsystem] - value_mean[!songsystem])
+
+df_sum_song = df_sum %>% filter(songsystem)
+```
+
+### Fold-change ranking
+```{r}
+p = "ra"
+df_sum_song_cur = df_sum_song %>% 
+  #filter(position2==p)%>%
+  ungroup() %>%
+  group_by(position2) %>% 
+  arrange(value_mean_rel) %>% 
+  mutate(gene_id = factor(gene_id))  %>%
+  ungroup() %>% 
+  mutate(gene_id_index = 1:n())
+
+gg = ggplot(df_sum_song_cur, aes(gene_id_index, value_mean_rel)) +
+  geom_point() + 
+  geom_text_repel(aes(label=gene_id), size=2) + 
+  geom_hline(yintercept = 0) + 
+  facet_wrap(~position2) +
+  theme_bw() + 
+  theme(axis.text = element_text(size=6), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())
+gg
+
+plot_fname = file.path(out_dir, "fold-change_ranked.pdf")
+save_plot(plot_fname, gg, ncol = 2, nrow=2, base_height=2, base_asp = .8)
+```
+
+### Point plot
+```{r}
+
+walk(to_plot, function(npp) {
+  print(npp)
+
+  df_sum = df  %>% filter(gene_id %in% npp) %>% 
+  group_by(gene_id, position) %>%
+  summarize(value_mean = mean(value))
+if (nrow(df_sum) == 0)
+  return()
+gg = ggplot(df %>% filter(gene_id %in% npp), aes(position, value, color=position)) + 
+  geom_point(size = .5, alpha=.2, shape=16, position=position_jitter(width=.2)) + 
+  geom_point(data=df_sum, color="black", size=.5, aes(position, value_mean)) + 
+  scale_color_manual(values=position_colors) + 
+  #facet_grid(.~gene_id) + 
+  labs(x = "", y = "log expression") + 
+  theme_bw() + 
+  theme(
+    legend.position="none",
+    #strip.text = element_blank(),
+    #strip.background = element_blank(),
+    axis.title.y = element_text(size=6),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size=5),
+    axis.text.x = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks.y = element_line(size=.25),
+    axis.ticks.x = element_blank(),
+    panel.grid=element_blank())
+print(gg)
+save_plot(file.path(out_dir, sprintf("points_by_position_%s.pdf", npp)), gg, base_height=1, base_width=1, ncol=1, nrow=1)
+})
+```
+
+### Deaf
+```{r}
+to_plot = nps$SYMBOL
+var_to_plot = c("position", "tags", "procedure2", "kl_mean_log_scale_cut2_proc2")
+DefaultAssay(obj) = "combat_id2"
+
+md = obj@meta.data[,var_to_plot] %>%
+  rownames_to_column(var="id")
+df = FetchData(obj, c(to_plot), slot="data") %>%
+  as.data.frame() %>%
+  rownames_to_column(var="id") %>%
+  pivot_longer(cols=-id, names_to="gene_id", values_to="value") %>%
+  #mutate(id = as.numeric(id)) %>% 
+  #left_join(info2 %>% select(id, position, procedure2, tags)) %>%
+  left_join(md) %>% 
+  mutate(position = factor(position, levels=position_levels),
+         gene_id = factor(gene_id, levels=to_plot)) #%>%
+
+df_id = df %>% distinct(id, position) %>%
+  arrange(position) 
+id_levels = df_id$id
+
+df = df %>%
+  mutate(id = factor(id, levels=id_levels))
+```
+
+```{r}
+walk(to_plot, function(npp) {
+  print(npp)
+
+  df_sum = df  %>% filter(gene_id %in% npp) %>% 
+  group_by(gene_id, position, kl_mean_log_scale_cut2_proc2 ) %>%
+  summarize(value_mean = mean(value))
+if (nrow(df_sum) == 0)
+  return()
+gg = ggplot(df %>% filter(gene_id %in% npp), aes(position, value, color=kl_mean_log_scale_cut2_proc2)) + 
+  geom_point(size = .5, alpha=.2, shape=16, position=position_jitterdodge(dodge.width=.4, jitter.width=.1)) + 
+  geom_point(data=df_sum, color="black", size=.5, aes(position, value_mean)) + 
+ # scale_color_manual(values=position_colors) + 
+  #facet_grid(.~gene_id) + 
+  labs(x = "", y = "log expression") + 
+  theme_bw() + 
+  theme(
+    legend.position="none",
+    #strip.text = element_blank(),
+    #strip.background = element_blank(),
+    axis.title.y = element_text(size=6),
+    axis.title.x = element_blank(),
+    axis.text.y = element_text(size=5),
+    axis.text.x = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks.y = element_line(size=.25),
+    axis.ticks.x = element_blank(),
+    panel.grid=element_blank())
+print(gg)
+save_plot(file.path(out_dir, sprintf("points_by_position_deaf_%s.pdf", npp)), gg, base_height=1, base_width=1, ncol=1, nrow=1)
+})
+```
+
+
+Averaged by tags
+```{r}
+# df_tags = df %>% group_by(gene_id, position, tags, kl_mean_log_scale_cut2_proc2) %>%
+#   summarize(value_mean = mean(value),
+#             value_sem = sem(value))
+# df_tags_sum = df_tags %>% ungroup() %>%
+#   group_by(gene_id, position, kl_mean_log_scale_cut2_proc2) %>%
+#   summarize(value_mean_mean = mean(value_mean))
+# 
+# gg = ggplot(df_tags %>% filter(gene_id %in% crh), aes(position, value_mean)) + 
+#   geom_pointrange(aes(position, value_mean, ymin=(value_mean-value_sem), ymax=(value_mean+value_sem)), size = .05, fatten=0, alpha=1, color="grey", position=position_jitter(width=.2)) + 
+#   geom_point(data=df_tags_sum, aes(position, value_mean_mean, color=position),  size=1) + 
+#   scale_color_manual(values=position_colors) + 
+#   facet_grid(.~gene_id) + 
+#   labs(x = "", y = "log expression") + 
+#   theme_bw() + 
+#   theme(
+#     legend.position="none",
+#     strip.text = element_blank(),
+#     strip.background = element_blank(),
+#     axis.title.y = element_text(size=6),
+#     axis.title.x = element_blank(),
+#     axis.text.y = element_text(size=5),
+#     axis.text.x = element_blank(),
+#     axis.line = element_blank(),
+#     axis.ticks.y = element_line(size=.25),
+#     axis.ticks.x = element_blank(),
+#     panel.grid=element_blank())
+# gg
+# save_plot(file.path(out_dir, "points_by_position_mean_crh.pdf"), gg, base_height=1,  base_asp=1.1, ncol=length(crh), nrow=1)
+
+```
+
+```{r}
+  
+df_tags = df %>% 
+  filter(kl_mean_log_scale_cut2_proc2 %in% c("intact-1", "deaf-3")) %>% 
+  group_by(gene_id, position, tags, kl_mean_log_scale_cut2_proc2) %>%
+  summarize(value_mean = mean(value),
+            value_sem = sem(value))
+
+df_tags_sum = df_tags %>% ungroup() %>%
+  group_by(gene_id, position, kl_mean_log_scale_cut2_proc2) %>%
+  summarize(value_mean_mean = mean(value_mean),
+            value_mean_sem = sem(value_mean)) %>%
+  group_by(gene_id, position) %>%
+  mutate(value_mean_mean_norm = value_mean_mean - value_mean_mean[kl_mean_log_scale_cut2_proc2=="intact-1"])
+
+df_tags = df_tags %>%
+  left_join(df_tags_sum) %>%
+  group_by(gene_id, position) %>%
+  mutate(value_mean_norm = value_mean - value_mean_mean[kl_mean_log_scale_cut2_proc2=="intact-1"][1])
+
+
+positions_n = length(unique(df_tags$position))
+walk(to_plot, function(npp) {
+
+  df_tags_cur = df_tags %>% filter(gene_id %in% npp)
+  df_tags_sum_cur = df_tags_sum %>% filter(gene_id == npp)
+  if (nrow(df_tags_cur) == 0)
+    return()
+  
+  gg = ggplot(df_tags_cur, aes(position, value_mean)) + 
+     geom_hline(yintercept=0, linetype=2, color="grey") + 
+    geom_point(data=df_tags_cur, aes(kl_mean_log_scale_cut2_proc2, value_mean_norm), size = .05, alpha=1, color="grey", position=position_jitter(width=.2)) + 
+    geom_pointrange(data=df_tags_sum_cur, aes(kl_mean_log_scale_cut2_proc2, value_mean_mean_norm, ymin=(value_mean_mean_norm-value_mean_sem), ymax=(value_mean_mean_norm+value_mean_sem)), size = .05, fatten=0, alpha=1) + 
+    geom_line(data=df_tags_sum_cur, aes(kl_mean_log_scale_cut2_proc2, value_mean_mean_norm, group=gene_id)) + 
+    #scale_color_manual(values=position_colors) + 
+    facet_grid(.~position) + 
+    labs(x = "", y = "log expression") + 
+    theme_bw() + 
+    theme(
+      legend.position="none",
+      strip.text = element_blank(),
+      strip.background = element_blank(),
+      axis.title.y = element_text(size=6),
+      axis.title.x = element_blank(),
+      axis.text.y = element_text(size=5),
+      axis.text.x = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks.y = element_line(size=.25),
+      axis.ticks.x = element_blank(),
+      panel.grid=element_blank())
+  gg
+  save_plot(file.path(out_dir, str_interp("points_by_deaf_mean_${npp}.pdf")), gg, base_height=1,  base_asp=.6, ncol=positions_n, nrow=1)
+})
+```
+
+
+```{r}
+df_tags = df_tags %>%
+  mutate(songsystem = if_else(position %in% c("ra", "hvc", "lman", "x"), TRUE, FALSE),
+         position2 = case_when(position %in% c("ra", "arco") ~ "arco",
+                               position %in% c("hvc", "ncl") ~ "ncl",
+                               position %in% c("lman", "nido") ~ "nido",
+                               position %in% c("x", "stri") ~ "stri")) 
+```
+
+```{r}
+
+df_tags_p = df_tags %>%
+  group_by(gene_id, position2) %>%
+  do({
+    x = .$value_mean[.$songsystem]
+    y = .$value_mean[!.$songsystem]
+    
+    res = t.test(x, y, paired = F)
+    tidy(res)
+  }) %>%
+  ungroup() %>% 
+  group_by(gene_id) %>% 
+  mutate(p_adj = p.adjust(p.value))
+df_tags_p
+```
+
+
+## Load DEG analysis
+```{r}
+res = qread(deg_res)
+res_cur = res %>%
+  filter(!grepl("all$", contrast)) %>%
+  filter(gene_id %in% to_plot)
+```
+
+### Ranked plot
+```{r}
+p = "ra"
+df_sum_song_cur = res_cur %>% 
+  group_by(contrast) %>% 
+  arrange(logFC) %>% 
+  mutate(gene_id = factor(gene_id))  %>%
+  #ungroup() %>% 
+  mutate(gene_id_index = 1:n())
+
+gg = ggplot(df_sum_song_cur, aes(gene_id_index, logFC)) +
+  geom_point() + 
+  geom_text_repel(aes(label=gene_id), size=2) + 
+  geom_hline(yintercept = 0) + 
+  facet_wrap(~contrast) +
+  theme_bw() + 
+  coord_flip() + 
+  theme(axis.text = element_text(size=6), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())
+gg
+
+plot_fname = file.path(out_dir, "fold-change_ranked_deg.pdf")
+save_plot(plot_fname, gg, ncol = 3, nrow=2, base_height=2, base_asp = .8)
+```
+

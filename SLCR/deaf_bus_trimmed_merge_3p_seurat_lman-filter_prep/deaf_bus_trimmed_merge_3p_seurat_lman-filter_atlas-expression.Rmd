@@ -1,0 +1,194 @@
+
+
+````{r}
+library(tidyverse)
+library(qs)
+
+#library(WGCNA) # load before reshape2, as depends on reshape
+library(data.table)
+library(reshape2)
+library(gridExtra)
+
+library(Seurat)
+library(stringr)
+
+
+source("~/data2/rstudio/birds/utils/colors.R")
+source("~/data2/rstudio/birds/utils/db.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+source("~/data2/rstudio/birds/utils/common_aesthetics.R")
+source("~/data2/rstudio/birds/spatial_expression/spatial_expression.R")
+
+library(viridis)
+library(RColorBrewer)
+library(lazyeval)
+
+library(ggrepel)
+
+library(cowplot)
+
+library(ComplexHeatmap)
+library(future)
+
+```
+
+
+## Set up dir
+```{r}
+prefix_song = "~/data2/rstudio/birds/singing/song_analysis"
+prefix = "~/data2/rstudio/birds/singing/seq_analysis/summaries"
+root_dir = "deaf_bus_trimmed_merge_3p_seurat_lman-filter"
+data_dir = file.path(prefix, root_dir)
+
+script_name = "deaf_bus_trimmed_merge_3p_seurat_lman-filter_atlas-expression.Rmd"
+out_dir = file.path(prefix, script_name)
+dir.create(out_dir, recursive = T)
+data_fname = file.path(data_dir, "seurat_object.qs")
+```
+
+## Load metadata
+
+```{r}
+info_db = "combined.db"
+info_table = "db_info_combined_curated"
+info = load_umi_info(info_db, info_table)
+```
+
+```{r}
+info$position = factor(info$position, 
+                       levels=position_levels)
+
+info = info %>% 
+  mutate(procedure2 = if_else(experiment=="topography", "intact", procedure2)) %>%
+  mutate(is_lesion_side = as.logical(is_lesion_side)) %>%
+  mutate(is_lesion_side = if_else(experiment!="ulman", FALSE, is_lesion_side))
+
+info = info %>% mutate(section_area = if_else(is.na(section_area), 200L, section_area))
+```
+
+## Filter samples
+```{r}
+info = info %>% filter(experiment %in% c("deafening")) 
+```
+
+```{r}
+info %>% select(tags, procedure2) %>% table()  
+info %>% select(tags, is_lesion_side) %>% table()
+```
+
+```{r}
+info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+#info2 = droplevels(info %>% filter(!is.na(songsystem)))
+```
+
+
+```{r}
+# song_stats_full = readRDS(file.path(prefix_song, "song_stats_full.rds"))
+# 
+# ## Remove old simple_song_stats
+# stat_cnames = c("last_song_datetime",
+#                 "song_rate_med",
+#                 "minutes_from_last_song",
+#                 "num_songs_on_euth_date",
+#                 "first_song_datetime",
+#                 "nsongs_in_last_hour",
+#                 "nsongs_in_last_two_days" ,
+#                 "nsongs_in_last_two_days.1",
+#                 "nsongs_per_day_pre",
+#                 "nsongs_per_day_post",      
+#                 "nsongs_since_refdate",
+#                 "date.of.surgery",
+#                 "autolabel",
+#                 "euth_datetime",
+#                 "date")
+# info2 = info2 %>% select(-one_of(stat_cnames))
+# info2 = info2 %>% inner_join(song_stats_full)
+
+```
+
+```{r}
+# kl_db = src_sqlite("~/data2/rstudio/birds/deafen/song_analysis/lik/auto11/mid_mean_50_euclidean/data.db")
+# kl_data = collect(tbl(kl_db, "kl_summarized"))
+# 
+# kl_data = kl_data %>% dplyr::rename(kl_mean = mean_na,
+#                              tags = bird)
+# info2 = info2 %>% left_join(kl_data %>% select(tags, kl_mean))
+```
+
+## Load seq data
+```{r}
+obj = qread(data_fname)
+info2 = info2 %>% filter(id %in% Cells(obj))
+info2 = as.data.frame(info2)
+rownames(info2) = info2$id
+obj = obj[,Cells(obj) %in% info2$id]
+obj = AddMetaData(obj, info2)
+```
+
+## Load atlas
+```{r}
+atlas = spatial_load_atlas()
+```
+
+# Expression
+```{r}
+to_plot = c("SLC17A6", "PVALB", "AR", "CRH", "CRHBP", "CRHR1", "CRHR2", "BDNF", "SST")
+var_to_plot = c("position", "tags", "procedure2", "brain_side")
+DefaultAssay(obj) = "combat_id2"
+df = FetchData(obj, c(to_plot), slot="data") %>%
+  as.data.frame() %>%
+  rownames_to_column(var="id") %>%
+  pivot_longer(cols=-id, names_to="gene_id", values_to="value") %>%
+  mutate(id = as.numeric(id)) %>% 
+  left_join(info2 %>% distinct(id, position, procedure2, brain_side)) %>%
+  mutate(position = factor(position, levels=position_levels),
+         gene_id = factor(gene_id, levels=to_plot)) %>%
+  mutate(songsystem = case_when(position %in% c("ra", "hvc", "lman", "x") ~ 1,
+                                position %in% c("arco", "ncl", "nido", "stri") ~ 0))
+
+df_mean = df %>% group_by(position, gene_id, songsystem, brain_side) %>%
+  summarize(value_mean = mean(value))
+
+df_mean = df_mean %>%
+  mutate(songsystem = ifelse(songsystem==1, TRUE, FALSE))
+```
+
+```{r}
+
+mags = df_mean
+genes = to_plot[1]
+
+
+walk(to_plot, function(gene) {
+  mags_tmp = mags %>% filter(gene_id %in% gene) 
+  
+  zlims = c(floor(min(mags_tmp$value_mean)), ceiling(max(mags_tmp$value_mean)))
+  tmp = atlas %>% left_join(mags_tmp) %>%
+    mutate(songsystem = as.character(as.numeric(songsystem))) %>%
+    mutate(songsystem = if_else(is.na(songsystem), "2", songsystem)) %>%
+    mutate(gene_id = if_else(is.na(gene_id), na.omit(unique(gene_id)), gene_id))
+  
+  d = tmp
+  value = "value_mean"
+  gg = ggplot(d) + geom_sf(aes_string(fill=value, color="songsystem"), size=.2) +
+    coord_sf(datum=NA) +
+    scale_color_manual(values=c("1"="black", "0"=NA, "2"="grey")) +
+    theme_cowplot() + 
+    theme(panel.grid = element_blank(), legend.position="top" ) + 
+    guides(color=FALSE) + 
+    #facet_wrap(~gene_id, ncol=5) +
+    theme(plot.margin=unit(c(0,0,0,0),"mm")) +
+    scale_fill_viridis("log expression", breaks=zlims, limits=zlims)
+  print(gg)
+  save_plot(file.path(out_dir, sprintf("atlas_%s.pdf", gene)), gg, base_height=4, base_asp=.8 )
+})
+```
+
+```{r}
+gg = spatial_plot_baseline(df_mean, atlas, to_plot, is_db=F)
+gg
+#save_plot(file.path(out_dir, "atlas.pdf"), gg, base_height=.75, base_width=1, ncol=length(to_plot), nrow=1)
+```
+
+
+

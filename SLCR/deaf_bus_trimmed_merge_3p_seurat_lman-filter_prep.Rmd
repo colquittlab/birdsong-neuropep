@@ -1,0 +1,537 @@
+
+
+````{r}
+library(tidyverse)
+
+#library(WGCNA) # load before reshape2, as depends on reshape
+library(data.table)
+library(reshape2)
+library(gridExtra)
+
+
+library(stringr)
+#library(tidyr)
+
+source("~/nest/rstudio/utils/seq_analysis.R")
+source("~/nest/rstudio/utils/colors.R")
+#source("~/nest/rstudio/utils/network.R")
+source("~/nest/rstudio/utils/db.R")
+source("~/nest/rstudio/utils/stats.R")
+#source("~/nest/rstudio/utils/scde.R")
+source("~/nest/rstudio/utils/common_aesthetics.R")
+source("~/nest/rstudio/utils/scRNA.R")
+source("~/nest/rstudio/utils/preproccess.R")
+source("~/nest/rstudio/songanalysis/deafen_plot.R")
+library(viridis)
+library(RColorBrewer)
+library(lazyeval)
+library(limma)
+library(edgeR)
+#library(impute)
+library(ggrepel)
+library(rtracklayer)
+#library(toOrdinal)
+library(cowplot)
+library(here)
+#library(rctutils)
+library(Biostrings)
+library(BiocParallel)
+library(SummarizedExperiment)
+library(ComplexHeatmap)
+library(future)
+BiocParallel::register(MulticoreParam(6))
+select = dplyr::select 
+here = here::here
+options(httr_oob_default = T)
+```
+
+```{r}
+filter = dplyr::filter
+select = dplyr::select
+rename = dplyr::rename
+```
+
+## Set up dir
+```{r}
+prefix_song = "~/nest/rstudio/singing/song_analysis"
+prefix = "~/nest/rstudio/neuropeptide/SLCR"
+#prefix = file.path(prefix, "voom", "sumExpt")
+script_name = "deaf_bus_trimmed_merge_3p_seurat_lman-filter_prep"
+prefix_cur = file.path(prefix, script_name)
+dir.create(prefix_cur, recursive = T)
+out_fname = file.path(prefix_cur, "seurat_object.qs")
+
+data_dir = file.path("~/nest/rstudio/singing/seq_analysis/summaries/deaf_bus_trimmed_merge_3p_seurat/")
+data_fname = file.path(data_dir, "seurat_object.qs")
+```
+
+## Load data
+
+```{r}
+info_db = "combined.db"
+info_table = "db_info_combined_curated"
+info = load_umi_info(info_db, info_table)
+```
+
+```{r}
+info$position = factor(info$position, 
+                       levels=position_levels)
+
+info = info %>% 
+  mutate(procedure2 = if_else(experiment=="topography", "intact", procedure2)) %>%
+  mutate(is_lesion_side = as.logical(is_lesion_side)) %>%
+  mutate(is_lesion_side = if_else(experiment!="ulman", FALSE, is_lesion_side))
+
+info = info %>% mutate(section_area = if_else(is.na(section_area), 200L, section_area))
+```
+
+## Filter samples
+```{r}
+info = info %>% filter(experiment %in% c("deafening")) 
+```
+
+```{r}
+info %>% select(tags, procedure2) %>% table()  
+info %>% select(tags, is_lesion_side) %>% table()
+```
+
+```{r}
+info2 = droplevels(info %>% filter(!(position %in% c("lfs", "ov", "meso"))))
+#info2 = droplevels(info %>% filter(!is.na(songsystem)))
+```
+
+For GEO reporting
+```{r}
+info2$pool_index2 = paste(info2$pool, info2$index2, sep="_")
+info2_id = split(info2$id, info2$pool_index2)
+info2_id = map(info2_id, ~ paste(.x, collapse=","))
+```
+
+
+
+```{r}
+song_stats_full = readRDS(file.path(prefix_song, "song_stats_full.rds"))
+
+## Remove old simple_song_stats
+stat_cnames = c("last_song_datetime",
+                "song_rate_med",
+                "minutes_from_last_song",
+                "num_songs_on_euth_date",
+                "first_song_datetime",
+                "nsongs_in_last_hour",
+                "nsongs_in_last_two_days" ,
+                "nsongs_in_last_two_days.1",
+                "nsongs_per_day_pre",
+                "nsongs_per_day_post",      
+                "nsongs_since_refdate",
+                "date.of.surgery",
+                "autolabel",
+                "euth_datetime",
+                "date")
+info2 = info2 %>% select(-one_of(stat_cnames))
+info2 = info2 %>% inner_join(song_stats_full)
+
+```
+
+```{r}
+kl_db = src_sqlite("~/nest/rstudio/deafen/song_analysis/lik/auto11/mid_mean_50_euclidean/data.db")
+kl_data = collect(tbl(kl_db, "kl_summarized"))
+
+kl_data = kl_data %>% dplyr::rename(tags = bird)
+info2 = info2 %>% left_join(kl_data %>% select(tags, kl_mean, kl_median))
+```
+
+## Recalculate song stats
+```{r}
+song_stats = info2 %>% distinct(tags, .keep_all=T) %>%group_by(tags) %>% do({ 
+  #prep_wav_info(.$tags, .$ate_of_surgery, .$procedure2, "songs")
+  calc_simple_song_stats(.$tags, .$date.of.surgery, .$euth_datetime )
+})
+common_cols =intersect(colnames(info2), colnames(song_stats))
+common_cols = common_cols[!(common_cols %in% c("tags"))]
+
+info2 = info2 %>% select(-one_of(common_cols)) %>%
+  left_join(song_stats)
+```
+
+## Covariate transformations
+```{r}
+info2 = info2 %>% 
+  mutate(minutes_from_last_song = if_else(minutes_from_last_song>120, 120, minutes_from_last_song),
+         minutes_from_last_song_log = log1p(minutes_from_last_song))
+```
+
+
+## Load seq data
+```{r}
+se = qread(data_fname)
+info2 = info2 %>% filter(id %in% Cells(se))
+info2 = as.data.frame(info2)
+rownames(info2) = info2$id
+se = se[,Cells(se) %in% info2$id]
+se = AddMetaData(se, info2)
+```
+
+## Filter by CDR
+```{r}
+plot(density(se$cdr))
+```
+
+```{r}
+cdr_thresh = 0.3
+se = se[,se$cdr>cdr_thresh]
+se$cdr_scaled = scale(se$cdr)
+```
+
+## Filter likely nido contam in LMAN samples
+```{r}
+genes_to_plot = c("CALCB", "HTR1B", "AR", "PAPPA", "ADARB2")
+se_cur = subset(se, subset=position=="lman")
+md = se_cur@meta.data
+dat = GetAssayData(se_cur)[genes_to_plot,]
+datm = melt(dat)
+colnames(datm) = c("gene_id", "id", "value")
+datm = datm %>% left_join(md)
+datms = datm %>% pivot_wider(names_from="gene_id", values_from="value")
+```
+
+```{r}
+gg  = ggplot(datm, aes(id, value)) + 
+  geom_point() + 
+  facet_wrap(~gene_id)
+gg
+
+gg  = ggplot(datms, aes(ADARB2, CALCB)) + 
+  geom_point() 
+gg
+```
+
+```{r}
+gene_thresh = 7.5
+gene_to_thresh = "CALCB"
+
+datm_filt = datm %>% filter(gene_id == gene_to_thresh) %>%
+  filter(value < gene_thresh)
+
+
+cells =  Cells(se_cur)[se_cur$id %in% datm_filt$id]
+se_filt = subset(se, cells=cells, invert=T)
+se = se_filt
+```
+
+
+## Filter out lowly expressed genes
+```{r}
+# mean_thresh = 1
+# gene_means = rowMeans(log2(GetAssayData(se, slot="data")+1))
+# plot(density(gene_means))
+# abline(v = mean_thresh, col=2)
+# se1 = se[gene_means > mean_thresh,]
+# nrow(se1) / nrow(se)
+```
+
+## Filter out MT genes
+```{r}
+# tx = import("~/data2/assembly/lonStrDom1/ncbi/lonStrDom1.ncbi.apollo6/merge_inter_apollo_processed_mt_gffread.gtf")
+# tx_mt = tx[seqnames(tx)=="MT"]
+# 
+# other_mts = c("AZ255_gr01", "AZ255_gr02")
+# gene_mts = c(tx_mt$gene_name, other_mts)
+# 
+# mito_counts = colSums(assay(se1[rownames(se1) %in% gene_mts,]))
+# total_counts = colSums(assay(se1))
+# mito_frac = mito_counts / total_counts
+# se1$frac_mito = mito_frac
+# se1 = se1[!(rownames(se1) %in% gene_mts),]
+```
+
+```{r}
+genes_to_plot = c("CRHBP", "SST", "NPY", "EML6")
+coefs = FetchData(se, c(genes_to_plot)) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "gene", values_to="estimate")
+
+md = FetchData(se, c("num_songs_on_euth_date", "position", "tags", "procedure2", "cdr_scaled", "kl_mean", "nCount_RNA", "barcode", "index2", "frac_mito" )) %>%
+  as.data.frame() %>%
+  rownames_to_column()
+
+coefs = coefs %>% left_join(md)
+
+p = "ra"
+coefs_cur = coefs %>% filter(position==p) %>%
+  filter(gene == "SST") %>%
+  filter(procedure2=="intact")
+gg = ggplot(coefs_cur, aes(log(num_songs_on_euth_date), estimate, color=frac_mito)) + 
+  geom_point(position = position_jitter(width=.1)) +
+  facet_wrap(~gene)
+gg
+  
+```
+
+## Magnitudes
+```{r}
+run_fit = function(se, design_char, blocking=NULL) {
+  dat_cur = GetAssayData(se, "counts")
+  dge = DGEList(dat_cur)
+  dge = calcNormFactors(dge,method =c("TMMwsp"))
+  
+
+  info_df1 = se@meta.data  
+  design = model.matrix(as.formula(design_char), info_df1)
+  colnames(design) = make.names(colnames(design))
+  print(colnames(design))
+  v1 = voom(dge,design,plot=F, normalize.method=normalize.method)
+  
+  if (!is.null(blocking)) {
+  corfit = duplicateCorrelation(v1, design, block = info_df1[,blocking])
+  fit = lmFit(v1, design, block = info_df1[,blocking], correlation =
+                corfit$consensus.correlation)
+  } else {
+    fit = lmFit(v1, design)
+  }
+  return(fit)
+}
+
+redo = F
+outdir1 = paste(prefix_cur, sep="/")
+dir.create(outdir1)
+model_fname = file.path(outdir1, "fit_tags.rds")
+formula_fname = file.path(outdir1, "formula.txt")
+coef_fname = file.path(outdir1, "coefs.rds")
+normalize.method="none"
+blocking=NULL
+
+## Design
+des_char = "~0 + position:tags + cdr_scaled + frac_mito"
+
+if (redo) {
+  fit_tags = run_fit(se, des_char, blocking)
+  saveRDS(fit_tags, model_fname)
+  write_lines(des_char, path = formula_fname)
+} else {
+  fit_tags = readRDS(model_fname)
+}
+
+fit_tags = eBayes(fit_tags)
+coefs = fit_tags$coefficients[,-1]
+std_errors = sqrt(fit_tags$s2.post) * fit_tags$stdev.unscaled
+std_errors = std_errors[,-1]
+cd = data.frame(cn = colnames(coefs)) %>%
+  filter(grepl("position", cn)) %>% 
+  mutate(cn_s = map(cn, ~unlist(str_split(.x, "\\."))),
+         position = map_chr(cn_s, 1),
+         position = sub("position", "", position),
+         tags = map_chr(cn_s, 2),
+         tags = sub("tags", "", tags))
+se_cd = se@meta.data %>% distinct(tags, position, .keep_all=T)
+cd = cd %>% left_join(se_cd)
+
+coefs = coefs[,cd$cn]
+std_errors = std_errors[,cd$cn]
+se_coefs = SummarizedExperiment(assays=list(coef=coefs, std_errors = std_errors), colData = cd)
+saveRDS(se_coefs, coef_fname)
+```
+
+### Test plots
+```{r}
+md = colData(se_coefs) %>% 
+  as.data.frame() %>%
+  rownames_to_column(var="position_tags") %>%
+  select(tags, position, procedure2, position_tags)
+
+dat = assay(se_coefs, "coef")
+dat_m1 = as.data.frame(dat) %>% 
+  rownames_to_column(var="gene_id") %>% 
+  pivot_longer(-gene_id, names_to = "position_tags", values_to="value") %>%
+  left_join(md) 
+```
+
+```{r}
+dat_m2 = dat_m1 %>%
+  #lazy_dt %>%
+  filter(gene_id %in% c("PVALB", "LHX9", "PCP4")) %>%
+#filter(position == "ra") %>% 
+  as_tibble()
+
+gg = ggplot(dat_m2, aes(tags, value, color=procedure2)) + 
+  geom_point() +
+  facet_grid(gene_id~position) #+ coord_flip()
+gg
+```
+
+
+```{r}
+# genes = c("SST", "EML6")
+# se_coefs_cur = se_coefs[genes,]
+# 
+# coefs = assay(se_coefs_cur, "coef") %>%
+#   as.data.frame() %>%
+#   rownames_to_column() %>%
+#   pivot_longer(-rowname, names_to = "condition", values_to="estimate")
+# 
+# std_errors = assay(se_coefs_cur, "std_errors") %>%
+#   as.data.frame() %>%
+#   rownames_to_column() %>%
+#   pivot_longer(-rowname, names_to = "condition", values_to="std_error")
+# 
+# coefs = coefs %>% left_join(std_errors) %>%
+#   rename(gene = rowname) %>% 
+#   mutate(condition_s = map(condition, ~unlist(str_split(.x, "\\."))),
+#          position = sub("position", "", map_chr(condition_s, 1)),
+#          tags = sub("tags", "", map_chr(condition_s, 2)))
+# 
+# coefs_stat = coefs %>%
+#   group_by(gene, position) %>%
+#   summarize(estimate_mean = mean(estimate),
+#             estimate_sd = sd(estimate))
+# coefs = coefs %>% left_join(coefs_stat) %>%
+#   mutate(estimate_z = (estimate - estimate_mean) / estimate_sd,
+#          std_error_z = (std_error / estimate_sd))
+# md_tags = se1@meta.data %>% distinct(tags, .keep_all=T) %>%
+#   select(-position, -condition)
+# coefs = coefs %>% left_join(md_tags) %>%
+#   mutate(duration_sum_end_log = log1p(duration_sum_end))
+```
+
+```{r fig.height = 10}
+# ncols = 2
+# positions_to_use = c("ra", "hvc", "lman", "x")
+# walk(positions_to_use, function(p) {
+#   coefs_cur = coefs %>% filter(position==p)
+#   x_coefs = c("num_songs_on_euth_date_log")
+#   walk(x_coefs, function(x_coef) {
+#     gg = ggplot(coefs_cur, aes_string(x_coef, "estimate_z", color="procedure2")) + 
+#       geom_pointrange(aes(ymin=(estimate_z - std_error_z), ymax=(estimate_z + std_error_z)), size=.2) + 
+#       stat_smooth(se = F, method="loess", span=1, width=1) + 
+#       facet_wrap(~gene, ncol=ncols) + 
+#       scale_color_startrek() + 
+#       theme_minimal() + 
+#       labs(title=p)
+#     print(gg)
+#    # save_plot(file.path(genes_dir, sprintf("gene_by_%s_%s_z.pdf", x_coef, p)), gg, base_height = 2, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+#   })
+# })
+# 
+# walk(positions_to_use, function(p) {
+#   coefs_cur = coefs %>% filter(position==p)
+#   x_coefs = c("num_songs_on_euth_date_log")
+#   walk(x_coefs, function(x_coef) {
+#     gg = ggplot(coefs_cur, aes_string(x_coef, "estimate", color="procedure2")) + 
+#       geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+#       stat_smooth(se = F, method="loess", span=2, width=1) + 
+#       facet_wrap(~gene, ncol=ncols, scales="free") +
+#       scale_y_continuous(expand = expand_scale(add=1)) + 
+#       scale_color_startrek() + 
+#       theme_minimal() + 
+#       labs(title=p)
+#     print(gg)
+#    # save_plot(file.path(genes_dir, sprintf("gene_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+#   })
+# })
+```
+
+
+## Transformations
+
+```{r}
+md = se@meta.data %>% 
+  rownames_to_column() %>%
+  select(-nsongs_per_day_pre_scale) # from earlier calculation, replacing here
+
+md_tags = md %>%
+  #filter(!is.na(nsongs_per_day_pre)) %>% 
+  distinct(tags, num_songs_on_euth_date, kl_mean, nsongs_per_day_pre, procedure2, duration.of.experiment) %>%
+  mutate(num_songs_on_euth_date_log = log1p(num_songs_on_euth_date),
+         num_songs_on_euth_date_log_mean = mean(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_sd = sd(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_scale = (num_songs_on_euth_date_log - num_songs_on_euth_date_log_mean) / num_songs_on_euth_date_log_sd,
+         num_songs_on_euth_date_log_scale_trunc = case_when(num_songs_on_euth_date_log_scale < -2 ~ -2,
+                                                            num_songs_on_euth_date_log_scale > 2 ~ 2,
+                                                            TRUE ~ num_songs_on_euth_date_log_scale),
+         num_songs_on_euth_date_log_scale_cut2 = factor(as.numeric(num_songs_on_euth_date_log_scale_trunc > 0)),
+         num_songs_on_euth_date_log_scale_cut3 = factor(cut(num_songs_on_euth_date_log_scale_trunc, breaks=3, labels=F)),
+         num_songs_on_euth_date_log_scale_cut4 = factor(cut(num_songs_on_euth_date_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         
+         num_songs_on_euth_date_mean = mean(num_songs_on_euth_date),
+         num_songs_on_euth_date_sd = sd(num_songs_on_euth_date),
+         num_songs_on_euth_date_scale = (num_songs_on_euth_date - num_songs_on_euth_date_mean) / num_songs_on_euth_date_sd,
+         nsongs_per_day_pre = if_else(is.na(nsongs_per_day_pre), mean(nsongs_per_day_pre, na.rm=T), nsongs_per_day_pre),
+         nsongs_per_day_pre_scale = (nsongs_per_day_pre - mean(nsongs_per_day_pre)) / sd(nsongs_per_day_pre),
+         nsongs_per_day_pre_log = log1p(nsongs_per_day_pre),
+         nsongs_per_day_pre_log_sd = sd(nsongs_per_day_pre_log),
+         # nsongs_per_day_pre_log = if_else(is.na(nsongs_per_day_pre_log), mean(nsongs_per_day_pre_log, na.rm=T), nsongs_per_day_pre_log),
+         nsongs_per_day_pre_log_scale = (nsongs_per_day_pre_log - mean(nsongs_per_day_pre_log)) / nsongs_per_day_pre_log_sd ,
+         nsongs_per_day_pre_log_scale_trunc = case_when(nsongs_per_day_pre_log_scale < -2 ~ -2,
+                                                        nsongs_per_day_pre_log_scale > 2 ~ 2,
+                                                        TRUE ~ nsongs_per_day_pre_log_scale),
+         nsongs_per_day_pre_log_scale_cut2 = factor(as.numeric(nsongs_per_day_pre_log_scale_trunc > 0)),
+         nsongs_per_day_pre_log_scale_cut3 = factor(cut(nsongs_per_day_pre_log_scale_trunc, breaks=3, labels=F)),
+         nsongs_per_day_pre_log_scale_cut4 = factor(cut(nsongs_per_day_pre_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         
+         kl_mean_log = log(kl_mean + .1),
+         kl_mean_log_mean = mean(kl_mean_log),
+         kl_mean_log_sd = sd(kl_mean_log),
+         kl_mean_log_scale = (kl_mean_log - kl_mean_log_mean) / kl_mean_log_sd,
+         
+         #kl_mean_log_scale_cut3 = cut(kl_mean_log_scale, breaks=3, include.lowest = T, labels = F),
+         kl_mean_log_scale_trunc = case_when(kl_mean_log_scale < -2 ~ -2,
+                                             kl_mean_log_scale > 2 ~ 2,
+                                             TRUE ~ kl_mean_log_scale),
+         kl_mean_log_scale_cut3 = factor(cut(kl_mean_log_scale_trunc, breaks=3, labels=F)),
+         kl_mean_log_scale_cut4 = factor(cut(kl_mean_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         kl_mean_log_scale_cut3_proc2 = paste(procedure2, kl_mean_log_scale_cut3, sep="-"),
+         kl_mean_log_scale_cut3_proc2 = factor(kl_mean_log_scale_cut3_proc2, levels=c("intact-1", "intact-2", "deaf-2", "deaf-3"))
+  )
+
+md_tags = md_tags %>%
+  group_by(procedure2) %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = cut(kl_mean_log, breaks=c(-3, -1.3, -.65, 2), labels=F)) %>%
+  ungroup() %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = paste(procedure2, kl_mean_log_scale_cut2_proc2, sep="-")) %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = factor(kl_mean_log_scale_cut2_proc2, levels=c("intact-1", "intact-2", "deaf-2", "deaf-3"))) 
+  
+
+table(md_tags %>% select(procedure2, kl_mean_log_scale_cut2_proc2))
+
+md = md %>% 
+  select(-num_songs_on_euth_date, -kl_mean, -nsongs_per_day_pre) %>%
+  left_join(md_tags) %>%
+  mutate(frac_mito_scale = scale(frac_mito),
+         tags_position = paste(tags, position, sep="-")) %>%
+  column_to_rownames()
+
+se = AddMetaData(se, md)
+
+```
+
+
+## Save object
+```{r}
+qsave(se, out_fname)
+```
+
+## Export flat files
+```{r}
+dat = as.matrix(GetAssayData(se, slot="counts"))
+dat_fname = file.path(prefix_cur, "dat_filtered.csv")
+write.table(dat, file = dat_fname, quote=F, sep=",", row.names=T, col.names=T )
+dat_test = read.csv(dat_fname)
+```
+
+```{r}
+md_fname = file.path(prefix_cur, "metadata.csv")
+
+to_include = c("id", "nCount_RNA", "nFeature_RNA", "date_prepared", "collection.time", "minutes_until_frozen", "date.of.surgery",  "tags", "dob", "nest", "sex", "bird.age", "reference", "um_from_reference", "position", "songsystem", "section_area", "lib_plate", "lib_row", "lib_column", "barcode", "pool", "index1", "index2", "procedure2", "duration.of.experiment", "last_song_datetime", "minutes_from_last_song", "num_songs_on_euth_date", "first_song_datetime", "nsongs_per_day_pre", "frac_mito", "cdr", "kl_mean", "kl_mean_log_scale_cut2_proc2")
+md = se@meta.data
+md_select = md %>% select(one_of(to_include))
+write.table(md_select, md_fname, quote=F, sep=",", col.names=T, row.names=F)
+```
+
+```{r}
+md$pool_index2 = paste(md$pool, md$index2, sep="_")
+md_id = split(md$id, md$pool_index2)
+```
+
+
+

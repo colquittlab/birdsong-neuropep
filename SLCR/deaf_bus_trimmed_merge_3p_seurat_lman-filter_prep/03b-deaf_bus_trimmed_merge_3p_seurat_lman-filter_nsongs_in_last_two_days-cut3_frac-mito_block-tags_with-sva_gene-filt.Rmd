@@ -1,0 +1,1728 @@
+```{r}
+library(tidyverse)
+#library(GGally)
+
+#library(WGCNA) # load before reshape2, as depends on reshape
+#library(data.table)
+library(reshape2)
+
+
+source("~/nest/rstudio/utils/seq_analysis.R")
+source("~/nest/rstudio/utils/colors.R")
+#source("~/nest/rstudio/utils/network.R")
+source("~/nest/rstudio/utils/db.R")
+source("~/nest/rstudio/utils/stats.R")
+#source("~/nest/rstudio/utils/scde.R")
+source("~/nest/rstudio/utils/common_aesthetics.R")
+source("~/nest/rstudio/utils/scRNA.R")
+source("~/nest/rstudio/utils/gene_lists.R")
+library(viridis)
+library(RColorBrewer)
+
+library(limma)
+library(edgeR)
+library(sva)
+library(proxy)
+library(ggrepel)
+library(cowplot)
+library(egg)
+library(Biostrings)
+library(BiocParallel)
+library(SummarizedExperiment)
+library(ComplexHeatmap)
+library(future)
+library(circlize)
+library(scales)
+library(furrr)
+library(flextable)
+library(ggrastr)
+library(fgsea)
+
+#BiocParallel::register(MulticoreParam(6))
+filter = dplyr::filter
+rename = dplyr::rename
+select = dplyr::select
+#here = here::here
+#options(httr_oob_default = T)
+```
+
+## Set up dir
+
+```{r}
+prefix_song = "~/nest/rstudio/singing/song_analysis"
+prefix = "~/nest/rstudio/neuropeptide/SLCR"
+prefix_data = file.path(prefix, "deaf_bus_trimmed_merge_3p_seurat_lman-filter_prep")
+script_name = "03b-deaf_bus_trimmed_merge_3p_seurat_lman-filter_nsongs_in_last_two_days-cut3_frac-mito_block-tags_with-sva_gene-filt"
+prefix_cur = file.path(prefix_data, script_name)
+dir.create(prefix_cur, recursive = T)
+```
+
+## Load neuropeptide genes
+```{r}
+nps = read_delim("~/nest/gene_lists/neuropeptide_related_genes.txt")
+```
+
+## Function def
+
+```{r}
+run_fit = function(se, design_char, blocking) {
+  
+  info_df1 = se@meta.data
+  info_df1 = droplevels(info_df1)
+  
+  dat_cur = GetAssayData(se, "counts", assay="RNA")
+  dge = DGEList(dat_cur)
+  
+  ### Filter genes
+  #to_keep = filterByExpr(dge, group = info_df1[,blocking])
+  #sprintf("Num genes to keep: %s", sum(to_keep))
+  #dge = dge[to_keep,]
+  
+  dge = calcNormFactors(dge,method =c("TMMwsp"))
+  
+  ### FIT --------------------------------------------------
+
+  design = model.matrix(as.formula(design_char), info_df1)
+  colnames(design) = make.names(colnames(design))
+  print(colnames(design))
+  v1 = voom(dge,design,plot=F, normalize.method=normalize.method)
+  corfit = duplicateCorrelation(v1, design, block = info_df1[,blocking])
+  fit = lmFit(v1, design, block = info_df1[,blocking], correlation =
+                corfit$consensus.correlation)
+  return(fit)
+}
+```
+
+## Load object
+
+```{r}
+se_fname = file.path(prefix_data, "seurat_object.qs")
+se1 = qread(se_fname)
+```
+
+## Load coefs
+
+```{r}
+model_fname = file.path(prefix_data, "coefs.rds")
+se_coefs = readRDS(model_fname)
+```
+
+```{r}
+md = se1@meta.data
+md_tags = md %>% distinct(tags, .keep_all=T)
+
+gg = ggplot(md_tags, aes(num_songs_on_euth_date)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(frac_mito)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(log1p(num_songs_on_euth_date))) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(log(kl_mean+.1))) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_per_day_pre_scale)) + 
+  geom_density()
+gg
+```
+
+```{r}
+loc_trans = read_delim("~/nest/assembly/lonStrDom2/ncbi/GCF_005870125.1_lonStrDom2_genomic_loc_synonyms.txt", delim="\t")
+```
+
+## Gene filter
+```{r}
+
+redo = F
+gene_var_fname = file.path(prefix_data, "gene_variance_stats.rds")
+if (redo) {
+  dat = GetAssayData(se1, assay = "RNA", slot="data")
+  #dat = AverageExpression(se1)
+  
+  md = FetchData(se1, c("set", "duration.of.experiment", "procedure2", "tags", "position", "index2", "nCount_RNA")) %>%
+    rownames_to_column("id")
+  
+  dat_df_full = dat %>% as.data.frame %>% rownames_to_column(var="gene_id") %>% 
+    pivot_longer(-gene_id, names_to="id", values_to="value") %>% 
+    left_join(md) %>% 
+    mutate(set= factor(set))
+  
+  dat_df_avg = dat_df_full %>% group_by(gene_id, position, tags) %>% 
+    summarize(value=mean(value)) %>%
+    ungroup() 
+  
+  dat_df_var = dat_df_avg %>%
+    group_by(tags, gene_id) %>%
+    summarize(value_var_pos = LogVMR(value))  %>% 
+    filter(is.finite(value_var_pos)) %>% 
+    group_by(gene_id) %>%
+    summarize(value_var_pos_mean = mean(value_var_pos))
+  
+  
+  dat_df_var2 = dat_df_avg %>%
+    group_by(position, gene_id) %>%
+    summarize(value_var_tags = LogVMR(value)) %>%
+    ungroup() %>%
+    group_by(gene_id) %>%
+    summarize(value_var_tags_mean = mean(value_var_tags))
+  
+  dat_df_stat = dat_df_var %>% left_join(dat_df_var2)
+  # dat_df_stat = dat_df_stat %>%
+  #   mutate(top_diff = gene_id %in% dat_df$gene_id)
+  
+  mod = lm(value_var_pos_mean ~ value_var_tags_mean, dat_df_stat)
+  dat_df_stat$resid = residuals(mod)
+  saveRDS(dat_df_stat, gene_var_fname)
+} else {
+  dat_df_stat = readRDS(gene_var_fname)
+}
+```
+
+```{r}
+thresh_pos = .3
+thresh_tags = 1
+thresh_resid = -1
+gg = ggplot(dat_df_stat, aes(value_var_tags_mean, resid)) + 
+  geom_point() + 
+#  geom_abline(slope=mod$coefficients[2], intercept=mod$coefficients[1]-mod$coefficients[1]*6)
+  #geom_vline(xintercept=thresh_tags) + 
+  geom_hline(yintercept=thresh_resid)
+gg
+
+dat_df_stat_thresh = dat_df_stat %>%
+  filter(resid > thresh_resid)
+```
+
+```{r}
+se1 = se1[dat_df_stat_thresh$gene_id,]
+```
+
+## Transformations
+```{r}
+md = se1@meta.data %>% 
+  rownames_to_column() %>%
+  select(-nsongs_per_day_pre_scale) # from earlier calculation, replacing here
+
+md_tags = md %>%
+  #filter(!is.na(nsongs_per_day_pre)) %>% 
+  distinct(tags, num_songs_on_euth_date, kl_mean, nsongs_per_day_pre, procedure2, duration.of.experiment, nsongs_per_date_mean, nsongs_in_last_two_days, nsongs_in_last_two_days.1) %>%
+  mutate(num_songs_on_euth_date_log = log1p(num_songs_on_euth_date),
+         num_songs_on_euth_date_log_mean = mean(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_sd = sd(num_songs_on_euth_date_log),
+         num_songs_on_euth_date_log_scale = (num_songs_on_euth_date_log - num_songs_on_euth_date_log_mean) / num_songs_on_euth_date_log_sd,
+         num_songs_on_euth_date_log_scale_trunc = case_when(num_songs_on_euth_date_log_scale < -2 ~ -2,
+                                                            num_songs_on_euth_date_log_scale > 2 ~ 2,
+                                                            TRUE ~ num_songs_on_euth_date_log_scale),
+         num_songs_on_euth_date_log_scale_cut2 = factor(as.numeric(num_songs_on_euth_date_log_scale_trunc > 0)),
+         num_songs_on_euth_date_log_scale_cut3 = factor(cut(num_songs_on_euth_date_log_scale_trunc, breaks=3, labels=F)),
+         num_songs_on_euth_date_log_scale_cut4 = factor(cut(num_songs_on_euth_date_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         
+         num_songs_on_euth_date_mean = mean(num_songs_on_euth_date),
+         num_songs_on_euth_date_sd = sd(num_songs_on_euth_date),
+         num_songs_on_euth_date_scale = (num_songs_on_euth_date - num_songs_on_euth_date_mean) / num_songs_on_euth_date_sd,
+         nsongs_per_day_pre = if_else(is.na(nsongs_per_day_pre), mean(nsongs_per_day_pre, na.rm=T), nsongs_per_day_pre),
+         nsongs_per_day_pre_scale = (nsongs_per_day_pre - mean(nsongs_per_day_pre)) / sd(nsongs_per_day_pre),
+         nsongs_per_day_pre_log = log1p(nsongs_per_day_pre),
+         nsongs_per_day_pre_log_sd = sd(nsongs_per_day_pre_log),
+         # nsongs_per_day_pre_log = if_else(is.na(nsongs_per_day_pre_log), mean(nsongs_per_day_pre_log, na.rm=T), nsongs_per_day_pre_log),
+         nsongs_per_day_pre_log_scale = (nsongs_per_day_pre_log - mean(nsongs_per_day_pre_log)) / nsongs_per_day_pre_log_sd ,
+         nsongs_per_day_pre_log_scale_trunc = case_when(nsongs_per_day_pre_log_scale < -2 ~ -2,
+                                                        nsongs_per_day_pre_log_scale > 2 ~ 2,
+                                                        TRUE ~ nsongs_per_day_pre_log_scale),
+         nsongs_per_day_pre_log_scale_cut2 = factor(as.numeric(nsongs_per_day_pre_log_scale_trunc > 0)),
+         nsongs_per_day_pre_log_scale_cut3 = factor(cut(nsongs_per_day_pre_log_scale_trunc, breaks=3, labels=F)),
+         nsongs_per_day_pre_log_scale_cut4 = factor(cut(nsongs_per_day_pre_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         
+         kl_mean_log = log(kl_mean + .1),
+         kl_mean_log_mean = mean(kl_mean_log),
+         kl_mean_log_sd = sd(kl_mean_log),
+         kl_mean_log_scale = (kl_mean_log - kl_mean_log_mean) / kl_mean_log_sd,
+         
+         #kl_mean_log_scale_cut3 = cut(kl_mean_log_scale, breaks=3, include.lowest = T, labels = F),
+         kl_mean_log_scale_trunc = case_when(kl_mean_log_scale < -2 ~ -2,
+                                             kl_mean_log_scale > 2 ~ 2,
+                                             TRUE ~ kl_mean_log_scale),
+         kl_mean_log_scale_cut3 = factor(cut(kl_mean_log_scale_trunc, breaks=3, labels=F)),
+         kl_mean_log_scale_cut4 = factor(cut(kl_mean_log_scale_trunc, breaks=c(-2,-1,0,1,2), labels=F)),
+         kl_mean_log_scale_cut3_proc2 = paste(procedure2, kl_mean_log_scale_cut3, sep="-"),
+         kl_mean_log_scale_cut3_proc2 = factor(kl_mean_log_scale_cut3_proc2, levels=c("intact-1", "intact-2", "deaf-2", "deaf-3")),
+         nsongs_per_date_mean_scale = scale(nsongs_per_date_mean),
+         nsongs_in_last_two_days_log = log(nsongs_in_last_two_days+1),
+         nsongs_in_last_two_days_log_scale = scale(log(nsongs_in_last_two_days+1)),
+         nsongs_in_last_two_days_log_scale_cut3 = factor(cut_number(nsongs_in_last_two_days_log_scale, n=3, labels=F)),
+         nsongs_in_last_two_days_sqrt_scale = scale(sqrt(nsongs_in_last_two_days)),
+         nsongs_in_last_two_days.1_log_scale = scale(log(nsongs_in_last_two_days.1+1)),
+  )
+```
+
+```{r}
+tmp = md_tags %>% 
+  mutate(nsongs_in_last_two_days_log_scale_cut3 = factor(nsongs_in_last_two_days_log_scale_cut3, labels=c("low", "mid", "high")))
+gg = ggplot(tmp, aes(nsongs_in_last_two_days_log_scale_cut3, nsongs_in_last_two_days_log)) + 
+  geom_point(position=position_jitter(width=.2)) + 
+  stat_summary(color="red") + 
+  theme_bw() 
+gg
+save_plot(file.path(outdir1, "covariate_cut.pdf"), gg, base_height=2, base_asp=1)
+```
+
+```{r}
+
+md_tags = md_tags %>%
+  group_by(procedure2) %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = cut(kl_mean_log, breaks=c(-3, -1.3, -.65, 2), labels=F)) %>%
+  ungroup() %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = paste(procedure2, kl_mean_log_scale_cut2_proc2, sep="-")) %>%
+  mutate(kl_mean_log_scale_cut2_proc2 = factor(kl_mean_log_scale_cut2_proc2, levels=c("intact-1", "intact-2", "deaf-2", "deaf-3"))) 
+  
+
+table(md_tags %>% select(procedure2, kl_mean_log_scale_cut2_proc2))
+
+md = md %>% 
+  select(-num_songs_on_euth_date, -kl_mean, -nsongs_per_day_pre, -nsongs_in_last_two_days.1, -nsongs_in_last_two_days) %>%
+  left_join(md_tags %>% 
+              select(tags, 
+                     nsongs_in_last_two_days.1_log_scale, 
+                     nsongs_in_last_two_days_log_scale, 
+                     nsongs_in_last_two_days_sqrt_scale,
+                     nsongs_in_last_two_days_log_scale_cut3
+                     )
+            ) %>%
+  mutate(frac_mito_scale = scale(frac_mito),
+         tags_position = paste(tags, position, sep="-")) %>%
+  column_to_rownames()
+
+se1 = AddMetaData(se1, md)
+
+se1$index2_pool = paste(se1$index2, se1$pool, sep="-")
+```
+
+```{r}
+md %>% select(position, tags) %>% table()
+```
+
+```{r}
+md = se1@meta.data
+md_tags = md %>% distinct(tags, .keep_all=T)
+
+gg = ggplot(md_tags, aes(num_songs_on_euth_date_log_scale)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_per_day_pre_log_scale)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days)) + 
+  geom_density()
+gg  
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days_scale)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days_sqrt_scale)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days.1)) + 
+  geom_density()
+gg  
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days.1_scale)) + 
+  geom_density()
+gg
+
+gg = ggplot(md_tags, aes(nsongs_in_last_two_days.1_log_scale)) + 
+  geom_density()
+gg
+
+```
+
+## SVA
+```{r}
+sv_dir = file.path(prefix_cur, "sva")
+dir.create(sv_dir)
+sv_fname = file.path(sv_dir, "sva.rds")
+vp_fname = file.path(sv_dir, "vp.rds")
+
+dat = as.matrix(GetAssayData(se1, slot = "counts"))
+  
+redo = F
+if (redo) {
+  
+  des_char ="~0 + position + position:nsongs_in_last_two_days_log_scale_cut3 + cdr_scaled + frac_mito_scale"
+  
+  des_char0 = "~0 + position + cdr_scaled + frac_mito_scale"
+  
+  mod = model.matrix(as.formula(des_char), se1@meta.data)
+  mod0 = model.matrix(as.formula(des_char0), se1@meta.data)
+  n.sv = num.sv(dat,mod,method="leek")
+  n.sv
+  
+  svobj = svaseq(dat, mod, mod0)
+  sv = svobj$sv
+  rownames(sv) = colnames(se1)
+  colnames(sv) = paste0("sv", 1:ncol(sv))
+  saveRDS(sv, sv_fname)
+  
+} else {
+  sv = readRDS(sv_fname)
+}
+
+redo_vp = F
+if (redo_vp) {
+  ## Variance partition
+  library(variancePartition)
+  dat_cur = dat
+  to_use = rowSums(cpm(dat_cur)>1) >=0.5 * ncol(dat_cur)
+  dat_cur1 = dat_cur[to_use,]
+  
+  info = as.data.frame(cbind(se1@meta.data, sv))
+  # info = as.data.frame(se1@meta.data)
+  info = info %>%
+    mutate(lib_column = factor(lib_column),
+           set = factor(set))
+  gExpr = DGEList(counts=dat_cur1)
+  gExpr = calcNormFactors(gExpr, method = "TMMwsp")
+  
+  design = model.matrix( ~ 1, info)
+  vobjGenes = voom(gExpr, design )
+  
+  #param = SnowParam(workers = 4, type = "SOCK")
+  param = MulticoreParam(workers = 8)
+  
+  form = ~ cdr_scaled + frac_mito_scale + sv1 + sv2 + sv3 + sv4 + sv5 + sv6 + sv7 + sv8 + sv9 + sv10 + (1|lib_column) + (1|set) + (1|index2_pool) +
+    (1|position)
+  varPart = fitExtractVarPartModel(vobjGenes, form, info, BPPARAM = param )
+  
+  saveRDS(varPart, vp_fname)
+} else {
+  varPart = readRDS(vp_fname)
+}
+
+vp <- sortCols( varPart )
+plotPercentBars( vp[c("CRHBP", "SST", "EGR1", "SLC17A6"),] )
+gg = plotVarPart( vp )
+gg
+save_plot(file.path(sv_dir, "variancePartition_variance.pdf"), gg)
+
+vp %>% as.data.frame() %>% rownames_to_column() %>%
+  pivot_longer(-rowname) %>%
+  group_by(name) %>%
+  summarize(value_median = median(value),
+            value_mean = mean(value),
+            value_n = sum(value>.1)) %>%
+  arrange(desc(value_n))
+
+
+
+se1 = AddMetaData(se1, as.data.frame(sv))
+```
+
+
+## Model
+```{r}
+redo = F
+max_sv = 2
+
+outdir1 = file.path(prefix_cur, sprintf("sv%s", max_sv))
+dir.create(outdir1)
+
+model_fname = file.path(outdir1, "fit.rds")
+formula_fname = file.path(outdir1, "formula.txt")         
+normalize.method="none"
+blocking="tags"
+
+se1_cur = se1
+
+des_char = "~0 + position + position:nsongs_in_last_two_days_log_scale_cut3 + cdr_scaled + frac_mito_scale"
+if (max_sv > 0) {
+  svs = paste(paste0("sv", 1:max_sv), collapse=" + ")
+  des_char =paste(des_char, svs, sep=" + ")
+}
+
+if (redo) {
+  fit = run_fit(se1_cur, des_char, blocking)
+  saveRDS(fit, model_fname)
+  write_lines(des_char, file = formula_fname)
+} else {
+  fit = readRDS(model_fname)
+}
+
+```
+### Standard errors
+```{r}
+fit1 = eBayes(fit)
+coefs = fit1$coefficients[,-1]
+std_errors = sqrt(fit1$s2.post) * fit1$stdev.unscaled
+std_errors = std_errors[,-1]
+cd = data.frame(cn = colnames(coefs)) %>%
+  filter(grepl("position", cn)) %>% 
+  mutate(cn_s = map(cn, ~unlist(str_split(.x, "\\."))),
+         cn_s_len = map_int(cn_s, length)) %>%
+  filter(cn_s_len > 1) %>%
+  mutate(
+    position = map_chr(cn_s, 1),
+         position = sub("position", "", position),
+    coef_orig = sub("position[a-z]+\\.", "", cn))
+
+coefs = coefs[,cd$cn]
+std_errors = std_errors[,cd$cn]
+se_coefs = SummarizedExperiment(assays=list(coef=coefs, std_errors = std_errors), colData = cd)
+```
+
+## Contrasts
+
+```{r}
+outdir2 = file.path(outdir1, "by_position")
+dir.create(outdir2)
+results_fname = file.path(outdir1, "model_results.rds")
+redo = F
+positions = unique(se1$position)
+if (redo) {
+  #fit = eBayes(fit)
+  #ref_pos = "ra"
+  design = fit$design
+  coefs = c("position%s.nsongs_in_last_two_days_log_scale_cut33")
+  
+  res = map(positions, function(p) {
+    map(coefs, function(co) {
+    print(p)
+    #coefs1 = paste(sprintf("position_condition%s_1d", p), c("none", "onset"), sep="-")
+    #coefs2 = paste(sprintf("position_condition%s_20-21d", p), c("none", "offset", "onset"), sep="-")
+  #if (p == ref_pos) {
+  #  coef = c("nsongs_per_date_mean")
+  #} else {
+    
+    
+  #   coef = list(nsong = sprintf("position%s.nsongs_in_last_two_days_sqrt_scale", p),
+  #               deaf = sprintf("position%s.procedure2intact", p))
+  # #}
+  # 
+  # cmat = makeContrasts(contrasts=coef,
+  #                      levels=colnames(design))
+    
+  fit2 = contrasts.fit(fit, coefficients = sprintf(co, p))   
+  fit2 = eBayes(fit2)
+  tt = topTable(fit2, p.value=1, number=nrow(se1), confint=T)
+  tt = as.data.frame(tt) %>% rownames_to_column(var="gene_id")
+  #fit = eBayes(fit)
+  #tt = topTable(fit, p.value=1, number=nrow(dat), confint=T, coef = coef)
+  #tt = topTable(fit, p.value=1, number=nrow(dat), confint=T, coef = "nsongs_per_date_mean")
+  #tt = as.data.frame(tt) %>% rownames_to_column(var="gene_id")
+  tt
+    }) %>% set_names(coefs) %>% bind_rows(.id="coef")
+}) %>% set_names(positions) %>% bind_rows(.id="position")
+
+res = res %>% mutate(position = factor(position, levels=position_levels))
+saveRDS(res, results_fname)
+} else{
+  res = readRDS(results_fname)
+}
+```
+
+```{r}
+res %>% filter(adj.P.Val<.1) %>% select(position, coef) %>% table()
+```
+
+### Across songsystem
+
+```{r}
+outdir2 = file.path(outdir1, "songsystem")
+dir.create(outdir2)
+results_fname = file.path(outdir2, "model_results.rds")
+redo = T
+
+if (redo) {
+design = fit$design
+
+positions = unique(se1$position)
+cons_pos = map(positions, ~sprintf("(position%s.nsongs_in_last_two_days_log_scale_cut33)", .x)) %>% set_names(positions)
+cons_list = list(
+  songsystem= sprintf("%s + %s + %s", cons_pos[["ra"]], cons_pos[["hvc"]], cons_pos[["lman"]]), 
+  songsystem_specific = sprintf("(%s + %s + %s) - (%s + %s + %s)", 
+                                cons_pos[["ra"]], cons_pos[["hvc"]], cons_pos[["lman"]],
+                                cons_pos[["arco"]], cons_pos[["ncl"]], cons_pos[["nido"]]) 
+  )
+
+cons_list = c(cons_list, cons_pos)
+
+cmat = makeContrasts(contrasts=cons_list,
+                     levels=colnames(design))
+colnames(cmat) = names(cons_list)
+fit2 = contrasts.fit(fit, cmat)   
+fit2 = eBayes(fit2)
+
+res_cons = map(names(cons_list), function(x) {
+  tt = topTable(fit2, p.value=1, number=nrow(dat), confint=T, coef = x)
+  tt = as.data.frame(tt) %>% rownames_to_column(var="gene_id")
+  tt
+}) %>% set_names(names(cons_list)) %>% bind_rows(.id="contrast")
+saveRDS(res_cons, results_fname)
+} else {
+  res_cons = readRDS(results_fname)
+}
+```
+
+Save flat file
+```{r}
+results_flat_fname = sub(results_fname, "rds", "txt")
+write_delim(res_cons, results_flat_fname, quote=NULL, delim="\t")
+```
+
+```{r}
+tab = res_cons %>% 
+  filter(adj.P.Val<.1) %>%
+  mutate(logFC_abs = abs(logFC)) %>%
+  #filter(logFC_abs > 1) %>% 
+  group_by(contrast) %>%
+  summarize(n=n()) #%>%
+#pivot_wider(names_from="contrast", values_from="n") %>% arrange(contrast)
+
+ft = flextable(tab)
+ft
+
+save_as_html(ft, path = file.path(outdir2, "deg_table.html"))
+
+
+tab = res_cons %>% filter(adj.P.Val<.1) %>% 
+  mutate(logFC_abs = abs(logFC)) %>%
+  #Efilter(logFC_abs > 1) %>% 
+  mutate(sign = sign(logFC)) %>%
+  group_by(contrast, sign) %>%
+  summarize(n=n()) 
+
+ft = flextable(tab)
+ft
+
+save_as_html(ft, path = file.path(outdir2, "deg_table_signed.html"))
+
+```
+
+```{r}
+tab = res_cons %>% 
+  filter(gene_id %in% nps$SYMBOL) %>% 
+  filter(adj.P.Val<.1) %>%
+  mutate(logFC_abs = abs(logFC)) %>%
+ # filter(logFC_abs > 1) %>% 
+  group_by(contrast) %>%
+  summarize(n=n()) #%>%
+#pivot_wider(names_from="contrast", values_from="n") %>% arrange(contrast)
+
+ft = flextable(tab)
+ft
+
+save_as_html(ft, path = file.path(outdir2, "deg_table_np.html"))
+
+
+tab = res_cons %>% 
+    filter(gene_id %in% nps$SYMBOL) %>% 
+  filter(adj.P.Val<.1) %>% 
+  mutate(logFC_abs = abs(logFC)) %>%
+ # filter(logFC_abs > 1) %>% 
+  mutate(sign = sign(logFC)) %>%
+  group_by(contrast, sign) %>%
+  summarize(n=n()) 
+
+ft = flextable(tab)
+ft
+
+save_as_html(ft, path = file.path(outdir2, "deg_table_np_signed.html"))
+
+```
+
+```{r}
+# res = res %>% mutate(effect_size = logFC / std_error)
+# gg = ggplot(res %>% filter(coef=="kl_mean_3"), aes(effect_size, color=position)) + 
+#   geom_density() 
+# gg
+```
+
+```{r}
+# md_tags_stats = md_tags %>%
+#   distinct(num_songs_on_euth_date_log_sd, num_songs_on_euth_date_sd, kl_mean_log_sd, nsongs_per_day_pre_log_sd) %>%
+#   pivot_longer(everything(), names_to="coef2", values_to="std.dev") %>%
+#   mutate(coef2 = sub("_sd", "", coef2))
+# 
+# res = res %>% mutate(coef2 = sub("position%s.", "", coef)) %>%
+#   mutate(coef2 = sub("_scale", "", coef2)) %>% 
+#   left_join(md_tags_stats)
+# 
+# res = res %>% mutate(logFC_rescale = logFC * std.dev)
+# 
+# res = res %>% left_join(loc_trans) 
+# res = res %>% mutate(gene_id = if_else(is.na(synonym), gene_id, synonym))
+```
+
+
+##### Volcano
+```{r}
+volcano_dir = file.path(outdir1, "volcano")
+dir.create(volcano_dir)
+```
+
+```{r}
+res = res %>% mutate(padjust_signed = -1 * log10(adj.P.Val))
+res = res %>% mutate(logFC_2 = 100* logFC)
+res = res %>% filter(gene_id != "RLOC_00005451g")
+```
+
+
+```{r}
+info2 = se1@meta.data
+pos_pos2_all = info2 %>% distinct(position, position2, position_pretty, songsystem)
+positions = levels(droplevels(res)$position)
+ggs = map(positions, function(p) {
+  pos_pos2_all = pos_pos2_all %>% mutate(col = position_colors[match(position, names(position_colors))])
+  pos_pos2_all_cur = pos_pos2_all %>% filter(position==p)
+  #pos_pos2_all_cur = pos_pos2_all_cur %>% mutate(color_label = if_else(songsystem, "white", "black"))
+  #nss = pos_pos2_all_cur %>% filter(!songsystem) %>% select(position) %>% unlist() %>% as.character()
+  #ss = pos_pos2_all_cur %>% filter(songsystem) %>% select(position) %>% unlist() %>% as.character()
+  tmp = res %>% filter(position==p) %>%
+    mutate(sig = adj.P.Val < .1) %>% 
+    mutate( class = "none",
+                    class = if_else(logFC< 0 & sig, "down" , class),
+                    class = if_else(logFC > 0 & sig, "up", class))
+  
+    #mutate( class = "none",
+    #                 class = if_else(estimate < 0 & sig, nss , class),
+    #                 class = if_else(estimate > 0 & sig, ss, class))
+  #colors_cur = pos_pos2_all_cur$col %>% set_names(pos_pos2_all_cur$position)
+  colors_cur = c(none="black", up = "firebrick3", down="dodgerblue4")
+  colors_fill = c(none="black", up = "firebrick1", down="dodgerblue2")
+  #colors_label_cur = pos_pos2_all_cur$color_label %>% set_names(pos_pos2_all_cur$position)
+  #colors_label_cur = c(none="black", colors_label_cur)
+  sig_label = tmp %>% 
+    filter(sig) %>%
+    top_n(-15, wt = adj.P.Val)
+  tmp = tmp %>%
+    mutate(gene_id_sig = ifelse(gene_id %in% sig_label$gene_id, gene_id, NA))
+  if (nrow(tmp) == 0)
+    next
+  gg = ggplot(tmp, aes(logFC, padjust_signed, color=class))
+  gg = gg + geom_point()
+  gg = gg + geom_label_repel(aes(label=gene_id_sig, fill=class), color="black", point.padding = .5, alpha=1)
+  gg = gg + scale_color_manual("", values=colors_cur)
+  #gg = gg + scale_color_manual("", values=colors_label_cur)
+  gg = gg + scale_fill_manual("", values=colors_fill)
+  gg = gg + labs(x="log2 fold-change mean num. songs / day",
+                y="-log10(adjusted p-value)",
+                title=as.character(pos_pos2_all_cur$position_pretty))
+  gg = gg + theme(legend.position="none")
+  save_plot(file.path(volcano_dir, sprintf("%s.pdf", p)), gg, base_height=6, base_aspect_ratio = 1.1)
+  save_plot(file.path(volcano_dir, sprintf("%s.png", p)), gg, base_height=6, base_aspect_ratio = 1.1)
+  return(gg)
+})
+#ggs = flatten(ggs)
+pg = plot_grid(plotlist=ggs, ncol=2, nrow=4, align="hv")
+save_plot(file.path(volcano_dir, "combined.pdf"), pg, ncol=2, nrow=4, base_height=5, base_aspect_ratio = 1.1)
+save_plot(file.path(volcano_dir, "combined.png"), pg, ncol=2, nrow=4, base_height=5, base_aspect_ratio = 1.1)
+pg
+#pg = plot_grid(plotlist=ggs, ncol=2, nrow=4, align="hv")
+#pg
+#save_plot(file.path(volcano_dir, "combined_grid.pdf"), pg, ncol=2, nrow=4, base_height=5, base_aspect_ratio = 1.1)
+#save_plot(file.path(volcano_dir, "combined_grid.png"), pg, ncol=2, nrow=4, base_height=5, base_aspect_ratio = 1.1)
+```
+```{r}
+res_mat = res %>% select(position, logFC, gene_id) %>% spread(position, logFC) %>%
+  mutate(to_label = if_else(gene_id=="CRHBP", gene_id, ""))
+gg = ggplot(res_mat, aes(ra, arco)) + 
+  geom_text_repel(aes(label=to_label)) + 
+  geom_point()
+gg
+```
+
+```{r}
+res_mat_cor = res_mat %>% select(-gene_id, -to_label) %>% as.matrix() %>% cor()
+```
+
+
+##### Heatmap
+```{r}
+heatmap_dir = file.path(outdir2, "heatmaps")
+dir.create(heatmap_dir)
+```
+
+```{r}
+ntop = 50
+res_sig = res_cons %>%
+  filter(contrast=="songsystem") %>%
+  filter(adj.P.Val<.1) %>%
+  top_n(ntop, abs(logFC))
+
+res_cons_cur = res_cons %>% filter(!grepl("song", contrast))  %>% filter(gene_id %in% res_sig$gene_id) %>%
+  rename(position = contrast) %>%
+  mutate(position = factor(position, levels=position_levels))
+mat = acast(res_cons_cur, gene_id~position, value.var="logFC")
+colnames(mat) = toupper(colnames(mat))
+
+width = .75
+height = width * nrow(mat) / ncol(mat)
+
+
+hm = Heatmap(mat, clustering_method_rows = "ward.D2", 
+             cluster_columns = F,
+             width = unit(width, "in"),
+             height =unit( height, "in"),
+             column_names_gp = gpar(fontsize=6), column_names_side = "top",
+             
+            row_names_gp = gpar(fontsize=6)
+           #  clustering_method_columns = "ward.D"
+             )
+
+pdf(file.path(heatmap_dir, "top_fc_heatmap_songsystem.pdf"), width=width+2, height=height+2)
+
+hm
+dev.off()
+hm
+```
+```{r}
+ntop = 40
+res_sig = res_cons %>%
+  filter(contrast=="songsystem_specific") %>%
+  filter(adj.P.Val<.1) %>%
+  #top_n(ntop,logFC)
+  filter(logFC>0)
+
+
+res_cons_cur = res_cons %>% filter(!grepl("song", contrast))  %>% filter(gene_id %in% res_sig$gene_id) %>%
+  rename(position = contrast) %>%
+  mutate(position = factor(position, levels=position_levels))
+mat = acast(res_cons_cur, gene_id~position, value.var="logFC")
+colnames(mat) = toupper(colnames(mat))
+
+width = .75
+height = width * nrow(mat) / ncol(mat)
+
+
+hm = Heatmap(mat, clustering_method_rows = "ward.D2", 
+             cluster_columns = F,
+             width = unit(width, "in"),
+             height =unit( height, "in"),
+             column_names_gp = gpar(fontsize=6), column_names_side = "top",
+             
+            row_names_gp = gpar(fontsize=6)
+           #  clustering_method_columns = "ward.D"
+             )
+
+pdf(file.path(heatmap_dir, "top_fc_heatmap_songsytem_specific.pdf"), width=width+2, height=height+2)
+
+hm
+dev.off()
+hm
+```
+```{r}
+ntop = 20
+res_sig = res_cons %>%
+  filter(contrast %in% c("ra", "hvc", "lman", "x")) %>% 
+  filter(!grepl("^LOC", gene_id )) %>% 
+  #filter(!grepl("songsystem", contrast)) %>%
+  filter(adj.P.Val<.1) %>%
+  group_by(contrast) %>% 
+  top_n(ntop, abs(logFC))
+
+res_cons_cur = res_cons %>% filter(!grepl("song", contrast))  %>% filter(gene_id %in% res_sig$gene_id) %>%
+  rename(position = contrast) %>%
+  mutate(position = factor(position, levels=position_levels))
+mat = acast(res_cons_cur, gene_id~position, value.var="logFC")
+
+colnames(mat) = toupper(colnames(mat))
+
+width = .75
+height = width * nrow(mat) / ncol(mat)
+
+
+hm = Heatmap(mat, clustering_method_rows = "ward.D2", 
+             cluster_columns = F,
+             width = unit(width, "in"),
+             height =unit( height, "in"),
+             column_names_gp = gpar(fontsize=6), column_names_side = "top",
+             
+            row_names_gp = gpar(fontsize=6)
+           #  clustering_method_columns = "ward.D"
+             )
+
+pdf(file.path(heatmap_dir, "top_fc_heatmap_songsystem_individual.pdf"), width=width+2, height=height+2)
+
+hm
+dev.off()
+hm
+```
+```{r}
+ntop = 20
+res_sig = res_cons %>%
+  filter(gene_id %in% nps$SYMBOL)
+
+res_cons_cur = res_cons %>% filter(!grepl("song", contrast))  %>%
+  filter(gene_id %in% res_sig$gene_id) %>%
+  rename(position = contrast) %>%
+  mutate(position = factor(position, levels=position_levels)) %>%
+  filter()
+
+mat = acast(res_cons_cur, gene_id~position, value.var="logFC")
+
+colnames(mat) = toupper(colnames(mat))
+
+width = .75
+height = width * nrow(mat) / ncol(mat)
+
+
+hm = Heatmap(mat, clustering_method_rows = "ward.D2", 
+             cluster_columns = F,
+             width = unit(width, "in"),
+             height =unit( height, "in"),
+             column_names_gp = gpar(fontsize=6), column_names_side = "top",
+             
+            row_names_gp = gpar(fontsize=6)
+           #  clustering_method_columns = "ward.D"
+             )
+
+pdf(file.path(heatmap_dir, "top_fc_heatmap_nps.pdf"), width=width+2, height=height+2)
+
+hm
+dev.off()
+hm
+```
+```{r}
+# #mat = scale(mat, scale = T)
+# km = kmeans(mat, centers = 10)
+# res = res %>% mutate(k = km$cluster[match(gene_id, names(km$cluster))])
+# res_sum = res %>% 
+#   group_by(k, position) %>% 
+#   summarize(logFC_mean = mean(logFC)) %>%
+#   mutate(position = factor(position, levels=position_levels))
+# gg = ggplot(res_sum, aes(position, logFC_mean)) + 
+#   geom_point()+ 
+#   theme_cowplot() + 
+#   facet_wrap(~k)
+# gg
+# 
+# gg = ggplot(res %>% filter(gene_id %in% c("CRHBP", "PMP2", "TRAP1")), aes(position, logFC)) + 
+#   geom_point()+ 
+#   theme_cowplot() + 
+#   facet_wrap(~gene_id)
+# gg
+```
+
+##### GSEA
+```{r}
+gsea_dir = file.path(outdir2, "gsea")
+dir.create(gsea_dir)
+```
+
+```{r}
+gsea_sub_dir = gsea_dir
+gsea_run_dir = file.path(gsea_sub_dir, "gsea_runs")
+dir.create(gsea_run_dir, recursive = T)
+
+gmt_dir = "~/nest/gene_lists/gmt"
+gmt_files = list.files(gmt_dir, full.names = T)
+```
+
+Filter gmts
+```{r}
+#dest_gmt_files = dest_gmt_files[!grepl("Drug|Disease", dest_gmt_files)]
+gmt_files = gmt_files[grep("c5.all.v7", gmt_files)]
+```
+
+```{r}
+gmt_pathway = gmtPathways(gmt_files)
+#to_exclude = names(gmt_pathway)
+#to_exclude = to_exclude[grep("ENDOPLAS|RIBOSOM|TRANSLATION|METABO|CATABOL|RESPIR|HYDROGEN|OXIDAT|OXIDO|MITOCH|PROTON|VIRAL|ELECTRON|ATP|RRNA|BIOSYNTHETIC|INORGANIC|INNER_MEMBRANE", to_exclude)]
+#gmt_pathway = gmt_pathway[!(names(gmt_pathway) %in% to_exclude)]
+```
+
+ARGs
+```{r}
+gray_gmt_fname = "~/nest/gene_lists/gray_2018_arg.xls.gmt"
+gray_gmt = gmtPathways(gray_gmt_fname)
+gray_gmt = gray_gmt[names(gray_gmt)!="ARGs"] # ARGs is full set
+```
+
+```{r}
+gmt_pathway = c(gmt_pathway, gray_gmt)
+```
+
+```{r}
+res_cons_cur = res_cons %>% 
+  filter(contrast == "songsystem_specific") %>%
+  filter(!grepl("^LOC", gene_id))
+rnks = res_cons_cur$t
+names(rnks) = res_cons_cur$gene_id
+rnks = sort(rnks)
+gsea_res = fgsea(pathways = gmt_pathway,
+                 stats = rnks,
+                 minSize=15,
+                 maxSize=500)
+
+gsea_res_filt = gsea_res %>% filter(padj<.1) %>% arrange(pval)
+collapsedPathways = collapsePathways(gsea_res_filt, pathways = gmt_pathway, stats = rnks)
+gsea_res_ind = gsea_res %>% filter(pathway %in% collapsedPathways$mainPathways)
+gsea_res_np = gsea_res %>% filter(grepl("HORMONE|NEUROTR|PEPTI|DENSE_CORE", pathway))
+gsea_res_ind = rbind(gsea_res_ind, gsea_res_np) %>% 
+  distinct(pathway, .keep_all=T) %>%
+  arrange(-NES)
+
+gsea_res_fname = file.path(gsea_dir, "gsea_res.rds")
+gsea_res_ind_fname = file.path(gsea_dir, "gsea_res_ind.rds")
+saveRDS(gsea_res, gsea_res_fname)
+saveRDS(gsea_res_ind, gsea_res_ind_fname)
+```
+
+```{r}
+gsea_res_ind_filt = gsea_res_ind %>% filter(padj<.1)
+gsea_res_ind_top = gsea_res_ind %>% 
+  filter(padj<.1) %>%
+  mutate(NES_abs = abs(NES)) %>%
+  top_n(30, NES_abs) 
+gsea_res_filt = gsea_res %>% filter(padj<.1)
+```
+
+```{r}
+tmp = gsea_res_ind_top %>% 
+  mutate(class = case_when(grepl("HORMONE|NEUROTR|PEPTI|DENSE_CORE", pathway) ~ "neuromodulation",
+                           grepl("VESICLE|SYNTAX|AXON", pathway) ~ "neurotransmission",
+                           grepl("PRGs", pathway) ~ "activity-dependent",
+                           grepl("OXID|NADH|MITO|RESPIR|PROTON|REDOX", pathway) ~ "respiration",
+                           grepl("RIBO|PROTEIN_LOCALIZ|TRANSLATION|RRNA", pathway) ~ "translation",
+                           TRUE ~ "none"),
+  ) %>%
+  mutate(pathway = sub("GO_", "", pathway),
+        pathway = case_when(grepl("ADAPTIVE_IMMUNE", pathway) ~ "ADAPTIVE_IMMUNE",
+                            grepl("ESTABLISHMENT_OF_PROTEIN", pathway) ~ "PROTEIN_LOCALIZATION_TO_ER",
+                            TRUE ~ pathway),
+         pathway = gsub("_", " ", pathway),
+  )  %>%
+  arrange(NES) %>%
+  mutate(pathway = factor(pathway, levels=pathway)) 
+
+cols =c("black",  pal_aaas()(5))
+names(cols) = c("none", "activity-dependent", "respiration",  "neuromodulation", "neurotransmission", "translation")
+gg = ggplot(tmp, aes(NES, pathway)) + 
+
+  geom_segment(aes(x=min(NES),xend = NES, y=pathway, yend=pathway), size=.25, linetype=3) + 
+  geom_segment(aes(x = 0, xend = NES, y=pathway, yend=pathway), size=.25) +
+  
+    geom_point(aes(color=class)) + 
+  theme_bw() + 
+  theme(axis.text = element_text(size=5),
+        axis.title = element_text(size=6),
+        axis.line.x = element_line(size=.25),
+        axis.line.y = element_blank(),
+        axis.ticks.x = element_line(size=.25),
+        axis.ticks.y = element_blank(),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(size=5)) + 
+  labs(y="") + 
+  scale_color_manual(values=cols, name="")
+gg
+save_plot(file.path(gsea_dir, "songsystem_point.pdf"), gg, base_height=3, base_width=4)
+```
+
+##### Specific genes
+
+```{r}
+genes_dir = file.path(outdir2, "specific_genes")
+dir.create(genes_dir)
+```
+###### Estimated coefs
+
+```{r}
+se_coefs = readRDS(file.path(prefix_data, "coefs.rds"))
+md = se1@meta.data
+md_tags = md %>% distinct(tags, procedure2)
+```
+
+```{r}
+ra_genes = c("CRHBP", "CREM", "SIX2", "SLC8A2", "BDNF", "HOMER1", "ARC", "EGR1", "NPY", "PROM1", "EML6", "SST", "PPP1R1C","FABP7", "AMN1", "CHCHD2", "IQUB", "PCSK2", "SCG2", "ATF3", "PRKCB", "CD24", "STMN1", "LOC110476506", "LPL", "RPL18", "CD99", "ETV1", "ATF4", "IGF2", "CHGB","CORT", "NTS" )
+lman_genes = c("SERPINI1", "NRN1", "AR", "CALCB", "PAPPA", "LGALS1", "RIMS4", "HTR1B", "PVALB", "BSN", "LRTM2", "RASL11B", "ATP1A1")
+genes = unique(c(ra_genes, lman_genes))
+se_coefs_cur = se_coefs#[genes,]
+
+coefs = assay(se_coefs_cur, "coef") %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="estimate")
+
+std_errors = assay(se_coefs_cur, "std_errors") %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="std_error")
+
+coefs = coefs %>% left_join(std_errors) %>%
+  rename(gene = rowname) %>% 
+  mutate(condition_s = map(condition, ~unlist(str_split(.x, "\\."))),
+         position = sub("position", "", map_chr(condition_s, 1)),
+         tags = sub("tags", "", map_chr(condition_s, 2))) %>%
+  left_join(md_tags)
+
+coefs_stat = coefs %>%
+ #   filter(procedure2=="intact") %>% 
+  group_by(gene, position) %>%
+  summarize(estimate_mean = mean(estimate, na.rm=T),
+            estimate_sd = sd(estimate, na.rm=T)) 
+
+coefs = coefs %>% left_join(coefs_stat) %>%
+  mutate(estimate_z = (estimate - estimate_mean) / estimate_sd,
+         std_error_z = (std_error / estimate_sd))
+md_tags = se1@meta.data %>% distinct(tags, .keep_all=T) %>%
+  select(-position, -condition)
+
+coefs = coefs %>% 
+  left_join(md_tags) 
+```
+
+```{r fig.width=4, fig.height=10}
+ncols = 2
+# coefs_lims = coefs %>% 
+#   group_by(gene) %>%
+#   summarize(ymin = min(estimate_z, na.rm=T),
+#             ymax = max(estimate_z, na.rm=T))
+positions = unique(coefs$position)
+coefs$position = factor(coefs$position, levels=position_levels)
+x_coefs = c("nsongs_in_last_two_days_sqrt_scale",
+            "num_songs_on_euth_date_log_scale",
+            #"nsongs_in_last_two_days_log_scale", 
+            #"nsongs_in_last_two_days",
+            "nsongs_per_date_mean"
+            )
+  #to_plot = c("CRHBP", "PVALB", "SST", "CRH", "NPY", "CREM", "BDNF")
+    to_plot = intersect(nps$SYMBOL, coefs$gene)
+  walk(x_coefs, function(x_coef) {
+    walk(to_plot, function(gene_cur) {
+      coefs_cur = coefs %>% filter(gene == gene_cur)
+      gg = ggplot(coefs_cur, aes(!!as.symbol(x_coef), estimate_z)) + 
+        geom_hline(yintercept=0, linetype=2) +
+        geom_pointrange(aes(ymin=(estimate_z - std_error_z), ymax=(estimate_z + std_error_z)), size=.2) + 
+        stat_smooth(aes(!!as.symbol(x_coef), estimate_z, color=position), method="lm", se = F, size=.5) + 
+        facet_wrap(~position, ncol=ncols) + 
+        scale_color_manual(values=position_colors, guide=F) + 
+        theme_cowplot()
+      print(gg)
+      save_plot(file.path(genes_dir, sprintf("gene_by_%s_%s_z.pdf", x_coef, gene_cur)), gg, base_height = 1.5, base_asp=1.2, ncol=ncols, nrow = ceiling(length(positions) / ncols))
+    })
+  })
+#})
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+
+coefs_lims = coefs %>% 
+  filter(position %in% positions_to_use) %>% 
+  group_by(gene) %>%
+  summarize(ymin = min(estimate_z, na.rm=T),
+            ymax = max(estimate_z, na.rm=T))
+
+x_coefs = c("num_songs_on_euth_date_log", "duration_sum_end_log", "duration_sum_end", "kl_mean_log", "kl_mean")
+
+group_vars = c("procedure2")
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  
+  walk(x_coefs, function(x_coef) {
+    walk(group_vars, function(group_var) {
+      gg = ggplot(coefs_cur, aes_string(x_coef, "estimate_z", color=group_var)) + 
+        geom_hline(yintercept=0, linetype=2) +
+        geom_pointrange(aes(ymin=(estimate_z - std_error_z), ymax=(estimate_z + std_error_z)), size=.2) + 
+        stat_smooth(se = F, method="loess", span=1, width=1) + 
+        
+        facet_wrap(~gene, ncol=ncols) + 
+        scale_color_startrek() + 
+        theme_cowplot()
+      print(gg)
+      save_plot(file.path(genes_dir, sprintf("gene_by_%s_split-by-%s_%s_z.pdf", x_coef, group_var, p)), gg, base_height = 2, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+    })
+  })
+})
+
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    walk(group_vars, function(group_var) {
+      gg = ggplot(coefs_cur, aes_string(x_coef, "estimate", color=group_var)) + 
+        geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+        stat_smooth(se = F, method="loess", span=2, width=1) + 
+        facet_wrap(~gene, ncol=ncols, scales="free") +
+        scale_y_continuous(expand = expand_scale(add=1)) + 
+        scale_color_startrek() + 
+        theme_minimal()
+      print(gg)
+      save_plot(file.path(genes_dir, sprintf("gene_by_%s_split-by-%s_%s.pdf", x_coef, group_var, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+    })
+  })
+})
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+x_coefs = c("kl_mean_log_scale_cut2_proc2")
+#cols = c("grey90", "grey50", "grey10")
+x_coef_levels =  levels(se1$kl_mean_log_scale_cut2_proc2)
+cols = brewer_pal(palette="Reds")(9)[seq(3, 9, length.out=length(x_coef_levels))]
+names(cols) = x_coef_levels
+
+coefs_sum = coefs %>%
+  group_by(position, gene, kl_mean_log_scale_cut2_proc2) %>%
+  summarize(estimate_mean = mean(estimate, na.rm=T))
+
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate")) + 
+      geom_point(position=position_jitter(width=.2), color="grey50") + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", color=x_coef), size=2) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=cols) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir, sprintf("gene_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+colorby="procedure2"
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)  #%>% filter(gene=="CRHBP")
+  coefs_sum_cur = coefs_sum %>% filter(position==p) #%>% filter(gene=="CRHBP")
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate")) + 
+      geom_point(position=position_jitter(width=.2), aes_string(color=colorby)) + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean"), color="black", size=2) + 
+      geom_line(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", group="gene"), color="black") + 
+
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=deaf_colors) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir, sprintf("gene_by_%s_colorby-%s_%s.pdf", x_coef, colorby, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+colorby="procedure2"
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_bar(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean"), fill="grey", color=NA, stat="identity") + 
+      geom_point(position=position_jitter(width=.2), aes_string(color=colorby)) + 
+
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=deaf_colors) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir, sprintf("bar_gene_by_%s_colorby-%s_%s.pdf", x_coef, colorby, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+x_coefs = c("kl_mean_log_scale_cut2_proc")
+#cols = c("grey90", "grey50", "grey10")
+cols = brewer_pal(palette="Reds")(9)[c(3,6,9)]
+names(cols) = c(1,2,3)
+
+coefs_cur = coefs %>% 
+  filter(gene %in% genes)
+coefs_sum = coefs_cur %>%
+  
+  group_by(position, gene, kl_mean_log_scale_cut2_proc) %>%
+  summarize(estimate_mean = mean(estimate, na.rm=T))
+
+walk(positions_to_use, function(p) {
+  coefs_cur1 = coefs_cur %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur1, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), color="grey50") + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", color=x_coef), size=2) + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=cols) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir, sprintf("lman-genes_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(lman_genes) / ncols))
+  })
+})
+
+colorby="procedure2"
+walk(positions_to_use, function(p) {
+  coefs_cur1 = coefs_cur %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur1, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), aes_string(color=colorby)) + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean"), color="black", size=2) + 
+      geom_line(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", group="gene"), color="black") + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=deaf_colors) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir, sprintf("lman-genes_by_%s_colorby-%s_%s.pdf", x_coef, colorby, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(lman_genes) / ncols))
+  })
+})
+
+``` 
+
+###### Residuals
+
+```{r}
+genes_dir_resid = file.path(genes_dir, "residuals")
+dir.create(genes_dir_resid)
+```
+
+Model reduced
+
+```{r}
+residuals_fname = file.path(outdir1, "seurat_drop-kl_mean_residuals.rds")
+se1_resid = readRDS(residuals_fname)
+resids =  GetAssayData(se1_resid, "counts", assay="residuals")
+```
+
+```{r}
+# dat_cur = GetAssayData(se1_cur, "counts", assay="RNA")
+#   dge = DGEList(dat_cur)
+#   dge = calcNormFactors(dge,method =c("TMMwsp"))
+# resids = residuals(fit, dge)
+```
+
+```{r}
+
+```
+
+```{r}
+genes = c("CRHBP", "CREM", "SIX2", "SLC8A2", "BDNF", "HOMER1", "ARC", "EGR1", "PROCA1", "NPY", "PROM1", "EML6", "NTN4", "SST" ,"FBXW4", "PPP1R1C", "LRRC4B", "SYT16", "SOD1", "FABP7", "AMN1", "CHCHD2", "IQUB", "PCSK2", "SCG2", "ATF3", "PRKCB", "CD24")
+resids_cur = resids[genes,]
+
+resids_df = resids_cur %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "id", values_to="estimate") %>%
+  mutate(estimate = log1p(estimate))
+
+# std_errors = assay(se_resids_df_cur, "std_errors") %>%
+#   as.data.frame() %>%
+#   rownames_to_column() %>%
+#   pivot_longer(-rowname, names_to = "condition", values_to="std_error")
+
+md = FetchData(se1_cur, c("position", "procedure2", "tags", "kl_mean_log_scale", "kl_mean_log_scale_cut2_proc", "num_songs_on_euth_date_log_scale")) %>%
+  rownames_to_column(var="id")
+resids_df = resids_df %>% 
+  left_join(md) %>%
+  #left_join(std_errors) %>%
+  rename(gene = rowname) #%>% 
+ # mutate(condition_s = map(condition, ~unlist(str_split(.x, "\\."))),
+#         position = sub("position", "", map_chr(condition_s, 1)),
+#         tags = sub("tags", "", map_chr(condition_s, 2))) %>%
+ # left_join(md_tags)
+
+# resids_df_stat = resids_df %>%
+#     filter(procedure2=="intact") %>% 
+#   group_by(gene, position) %>%
+#   summarize(estimate_mean = mean(estimate),
+#             estimate_sd = sd(estimate)) 
+# 
+# resids_df = resids_df %>% left_join(resids_df_stat) %>%
+#   mutate(estimate_z = (estimate - estimate_mean) / estimate_sd,
+#          std_error_z = (std_error / estimate_sd))
+# md_tags = se1@meta.data %>% distinct(tags, .keep_all=T) %>%
+#   select(-position, -condition)
+# 
+# resids_df = resids_df %>% left_join(md_tags) %>%
+#   mutate(duration_sum_end_log = log1p(duration_sum_end))
+```
+
+```{r}
+x_coefs = c("kl_mean_log_scale_cut2_proc")
+walk(positions_to_use, function(p) {
+  resids_df_cur = resids_df %>% filter(position==p)
+
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(resids_df_cur, aes_string(x_coef, "estimate", color="num_songs_on_euth_date_log_scale")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2)) + 
+      stat_summary() + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+     # scale_color_startrek(name="") + 
+      scale_color_continuous(name="") + 
+      theme_minimal()
+    print(gg)
+    save_plot(file.path(genes_dir_resid, sprintf("gene_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+```
+
+###### Batch corrected
+
+```{r}
+genes_dir_batch = file.path(genes_dir, "batch_corrected")
+dir.create(genes_dir_batch)
+```
+
+```{r}
+#se_coefs = readRDS(file.path(prefix_data, "coefs.rds"))
+se1$position_tags = paste(se1$position, se1$tags, sep=".")
+
+cdr_thresh = .5
+plot(density(se1$cdr))
+se1_filt = se1[,se1$cdr >= cdr_thresh]
+md = se1_filt@meta.data
+md_tags = md %>% distinct(tags, procedure2)
+se_dat = GetAssayData(se1_filt, assay="combat_id2")
+se_dat = se_dat[,match(md$id, colnames(se_dat))]
+
+Idents(se1_filt) = se1_filt$position_tags
+se_coefs = AverageExpression(se1_filt, assays="combat_id2")
+se_coefs = log1p(se_coefs[[1]])
+
+#se_coefs = t(apply(se_dat, 1, function(x) tapply()))
+se_sem = t(apply(se_dat, 1, function(x) tapply(x, md$position_tags, sem)))
+
+```
+
+```{r}
+ra_genes = c("CRHBP", "CREM", "SIX2", "SLC8A2", "BDNF", "HOMER1", "ARC", "EGR1", "PROCA1", "NPY", "PROM1", "EML6", "NTN4", "SST" ,"FBXW4", "PPP1R1C", "LRRC4B", "SYT16", "SOD1", "FABP7", "AMN1", "CHCHD2", "IQUB", "PCSK2", "SCG2", "ATF3", "PRKCB", "CD24", "STMN1", "LOC110476506", "LPL", "RPL18", "CD99")
+lman_genes = c("SERPINI1", "NRN1", "AR", "CALCB", "PAPPA", "LGALS1", "RIMS4", "HTR1B", "PVALB", "BSN")
+genes = unique(c(ra_genes, lman_genes))
+se_coefs_cur = se_coefs[genes,]
+
+coefs = se_coefs_cur %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="estimate")
+
+std_errors = se_sem %>% 
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="std_error")
+
+coefs = coefs %>% left_join(std_errors) %>%
+  rename(gene = rowname) %>% 
+  mutate(condition_s = map(condition, ~unlist(str_split(.x, "\\."))),
+         position = sub("position", "", map_chr(condition_s, 1)),
+         tags = sub("tags", "", map_chr(condition_s, 2))) %>%
+  left_join(md_tags)
+
+coefs_stat = coefs %>%
+    filter(procedure2=="intact") %>% 
+  group_by(gene, position) %>%
+  summarize(estimate_mean = mean(estimate),
+            estimate_sd = sd(estimate)) 
+
+coefs = coefs %>% left_join(coefs_stat) %>%
+  mutate(estimate_z = (estimate - estimate_mean) / estimate_sd,
+         std_error_z = (std_error / estimate_sd))
+md_tags = se1@meta.data %>% distinct(tags, .keep_all=T) %>%
+  dplyr::select(-position, -condition)
+
+coefs = coefs %>% left_join(md_tags) %>%
+  mutate(duration_sum_end_log = log1p(duration_sum_end))
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+
+coefs_lims = coefs %>% 
+  filter(position %in% positions_to_use) %>% 
+  group_by(gene) %>%
+  summarize(ymin = min(estimate_z, na.rm=T),
+            ymax = max(estimate_z, na.rm=T))
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p) 
+  x_coefs = c("num_songs_on_euth_date_log", "duration_sum_end_log", "duration_sum_end")
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate_z", color="procedure2")) + 
+      geom_hline(yintercept=0, linetype=2) +
+      geom_pointrange(aes(ymin=(estimate_z - std_error_z), ymax=(estimate_z + std_error_z)), size=.2) + 
+      stat_smooth(se = F, method="loess", span=1, width=1) + 
+
+      facet_wrap(~gene, ncol=ncols) + 
+      scale_color_startrek() + 
+      theme_cowplot()
+   # print(gg)
+    save_plot(file.path(genes_dir, sprintf("mean_gene_by_%s_%s_z.pdf", x_coef, p)), gg, base_height = 2, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  x_coefs = c("num_songs_on_euth_date_log", "duration_sum_end_log", "duration_sum_end")
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate", color="procedure2")) + 
+      geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_startrek() + 
+      theme_minimal()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("mean_gene_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+```
+
+```{r}
+positions_to_use = c("ra", "hvc", "lman")
+#walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position %in% positions_to_use) %>%
+    mutate(position = factor(position, levels=positions_to_use))
+  x_coefs = c("num_songs_on_euth_date_log", "duration_sum_end_log", "duration_sum_end")
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate_z", color="procedure2")) + 
+      geom_hline(yintercept=0, linetype=2) +
+      geom_pointrange(aes(ymin=(estimate_z - std_error_z), ymax=(estimate_z + std_error_z)), size=.2) + 
+      stat_smooth(se = F, method="loess", span=1, size=1) + 
+
+      facet_grid(gene~position, scales="free") + 
+      scale_color_startrek() + 
+      theme_cowplot()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("gene_by_%s_facet_z.pdf", x_coef)), gg, base_height = 1, base_asp=2, ncol=length(positions_to_use), nrow = length(genes))
+  })
+
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+x_coefs = c("kl_mean_log_scale_cut2_proc")
+#cols = c("grey90", "grey50", "grey10")
+cols = brewer_pal(palette="Reds")(9)[c(3,6,9)]
+names(cols) = c(1,2,3)
+
+coefs_sum = coefs %>%
+  group_by(position, gene, kl_mean_log_scale_cut2_proc) %>%
+  summarize(estimate_mean = mean(estimate, na.rm=T))
+
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), color="grey50") + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", color=x_coef), size=2) + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=cols) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("ra-genes_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+colorby="procedure2"
+walk(positions_to_use, function(p) {
+  coefs_cur = coefs %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), aes_string(color=colorby)) + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean"), color="black", size=2) + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=deaf_colors) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("ra-genes_by_%s_colorby-%s_%s.pdf", x_coef, colorby, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(genes) / ncols))
+  })
+})
+
+```
+
+```{r}
+ncols = 2
+positions_to_use = c("ra", "hvc", "lman")
+x_coefs = c("kl_mean_log_scale_cut2_proc")
+#cols = c("grey90", "grey50", "grey10")
+cols = brewer_pal(palette="Reds")(9)[c(3,6,9)]
+names(cols) = c(1,2,3)
+
+coefs_cur = coefs %>% 
+  filter(gene %in% lman_genes)
+coefs_sum = coefs_cur %>%
+  
+  group_by(position, gene, kl_mean_log_scale_cut2_proc) %>%
+  summarize(estimate_mean = mean(estimate, na.rm=T))
+
+walk(positions_to_use, function(p) {
+  coefs_cur1 = coefs_cur %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur1, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), color="grey50") + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean", color=x_coef), size=2) + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=cols) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("lman-genes_by_%s_%s.pdf", x_coef, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(lman_genes) / ncols))
+  })
+})
+
+colorby="procedure2"
+walk(positions_to_use, function(p) {
+  coefs_cur1 = coefs_cur %>% filter(position==p)
+  coefs_sum_cur = coefs_sum %>% filter(position==p)
+  walk(x_coefs, function(x_coef) {
+    gg = ggplot(coefs_cur1, aes_string(x_coef, "estimate")) + 
+      #geom_pointrange(aes(ymin=(estimate - std_error), ymax=(estimate + std_error)), size=.2) + 
+      geom_point(position=position_jitter(width=.2), aes_string(color=colorby)) + 
+      geom_point(data=coefs_sum_cur, aes_string(x_coef, y="estimate_mean"), color="black", size=2) + 
+      #stat_summary(fun.y = "mean", color="blue") + 
+     # stat_smooth(se = F, method="loess", span=2, width=1) + 
+      facet_wrap(~gene, ncol=ncols, scales="free") +
+      scale_y_continuous(expand = expand_scale(add=1)) + 
+      scale_color_manual(name="", values=deaf_colors) + 
+      theme_bw()
+    #print(gg)
+    save_plot(file.path(genes_dir_batch, sprintf("lman-genes_by_%s_colorby-%s_%s.pdf", x_coef, colorby, p)), gg, base_height = 1.5, ncol=ncols, nrow = ceiling(length(lman_genes) / ncols))
+  })
+})
+
+```
+
+###### Across ARGs
+
+```{r}
+library(fgsea)
+gray_gmt_fname = "~/data/gene_lists/gray_2018_arg.xls.gmt"
+gray_gmt = gmtPathways(gray_gmt_fname)
+gray_gmt_df = data.frame(gene = unlist(gray_gmt), class = rep(names(gray_gmt), times = map_int(gray_gmt, length)))
+```
+
+Mean logFC
+```{r}
+gray_gmt_df_cur = gray_gmt_df %>% filter(class=="rapid PRGs")
+res_cur = res %>% filter(gene_id %in% gray_gmt_df_cur$gene)
+res_cur_mean = res_cur %>%
+  group_by(position, coef) %>%
+  summarize(logFC_mean = mean(logFC),
+            logFC_sd = sd(logFC))
+
+gg = ggplot(res_cur %>% filter(coef=="num_songs_euth_date"), aes(gene_id, logFC)) + 
+  geom_point() + 
+  geom_hline(yintercept=0) + 
+  facet_wrap(~position) + 
+  coord_flip()
+gg
+```
+Whiteny singing genes
+```{r}
+## Singing
+sing_fname = "~/data/gene_lists/whitney_science_2014/Supplementary Table S8 - Singing Regulated Transcripts v53.xlsx"
+sing = readxl::read_xlsx(sing_fname, skip=2)
+colnames(sing) = make.names(colnames(sing))
+sing_hvc = sing %>% filter(HVC.p<.1) %>% 
+  filter(grepl("Up|Increase", HVC.Cluster)) %>% 
+  filter(!is.na(Symbol)) 
+
+sing_ra = sing %>% filter(RA.p<.1) %>% 
+  filter(grepl("Up|Increase", RA.Cluster)) %>% 
+  filter(!is.na(Symbol)) 
+
+
+res_cur = res %>% filter(gene_id %in% sing_ra$Symbol)
+res_cur_mean = res_cur %>%
+  group_by(position, coef) %>%
+  summarize(logFC_mean = mean(logFC),
+            logFC_sd = sd(logFC))
+
+gg = ggplot(res_cur %>% filter(coef=="num_songs_euth_date"), aes(gene_id, logFC)) + 
+  geom_point() + 
+  geom_hline(yintercept=0) + 
+  facet_wrap(~position) + 
+  coord_flip()
+gg
+```
+
+```{r}
+
+se_coefs_cur = se_coefs[genes,]
+
+coefs = assay(se_coefs_cur, "coef") %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="estimate")
+
+std_errors = assay(se_coefs_cur, "std_errors") %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to = "condition", values_to="std_error")
+
+coefs = coefs %>% left_join(std_errors) %>%
+  rename(gene = rowname) %>% 
+  mutate(condition_s = map(condition, ~unlist(str_split(.x, "\\."))),
+         position = sub("position", "", map_chr(condition_s, 1)),
+         tags = sub("tags", "", map_chr(condition_s, 2))) %>%
+  left_join(md_tags)
+
+coefs_stat = coefs %>%
+    filter(procedure2=="intact") %>% 
+  group_by(gene, position) %>%
+  summarize(estimate_mean = mean(estimate),
+            estimate_sd = sd(estimate)) 
+
+coefs = coefs %>% left_join(coefs_stat) %>%
+  mutate(estimate_z = (estimate - estimate_mean) / estimate_sd,
+         std_error_z = (std_error / estimate_sd))
+md_tags = se1@meta.data %>% distinct(tags, .keep_all=T) %>%
+  select(-position, -condition)
+coefs = coefs %>% left_join(md_tags) %>%
+  mutate(duration_sum_end_log = log1p(duration_sum_end))
+
+coefs = coefs %>% left_join(gray_gmt_df)
+coefs_mean = coefs %>%
+  group_by(position, class, tags, procedure2, num_songs_on_euth_date_log) %>%
+  summarize(estimate_z = mean(estimate_z)) 
+
+```
+
+```{r}
+gg = ggplot(coefs_mean %>% filter(position %in% c("ra", "hvc", "lman")), aes(num_songs_on_euth_date_log, estimate_z, color=procedure2)) + 
+  geom_point() + 
+  stat_smooth()  + 
+  facet_grid(class~position, scales="free_y")
+gg
+```
+

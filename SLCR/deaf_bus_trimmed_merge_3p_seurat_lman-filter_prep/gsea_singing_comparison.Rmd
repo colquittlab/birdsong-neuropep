@@ -1,0 +1,291 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tidyverse)
+library(fgsea)
+```
+
+```{r}
+data_dir = "~/nest/rstudio/neuropeptide/SLCR/deaf_bus_trimmed_merge_3p_seurat_lman-filter_prep/"
+
+sub_dirs = list(two_days="03b1-deaf_bus_trimmed_merge_3p_seurat_lman-filter_nsongs_in_last_two_days-cut3-v2_frac-mito_block-tags_with-sva_gene-filt",
+                euth_date="03c-deaf_bus_trimmed_merge_3p_seurat_lman-filter_num_songs_on_euth_date_log_scale_cut3_frac-mito_block-tags_with-sva_gene-filt",
+  overall_mean="03d-deaf_bus_trimmed_merge_3p_seurat_lman-filter_nsongs_per_date_mean_scale_cut3_frac-mito_block-tags_with-sva_gene-filt")
+res_dirs = map(sub_dirs, ~file.path(data_dir, .x, "sv2", "songsystem"))
+
+script_name = "gsea_singing_comparison"
+out_dir = file.path(data_dir, script_name)
+dir.create(out_dir)
+```
+### Load coefficients
+```{r}
+res = map(res_dirs, function(x) readRDS(file.path(x, "model_results.rds"))) 
+```
+
+### GSEA
+```{r}
+gmt_dir = "~/nest/gene_lists/gmt"
+gmt_files = list.files(gmt_dir, full.names = T)
+```
+
+Filter gmts
+```{r}
+
+gmt_files = gmt_files[grep("c5.all.v7", gmt_files)]
+gmt_pathway = gmtPathways(gmt_files)
+```
+
+ARGs
+```{r}
+gray_gmt_fname = "~/nest/gene_lists/gray_2018_arg.xls.gmt"
+gray_gmt = gmtPathways(gray_gmt_fname)
+gray_gmt = gray_gmt[names(gray_gmt)!="ARGs"] # ARGs is full set
+```
+
+```{r}
+gmt_pathway = c(gmt_pathway, gray_gmt)
+```
+
+```{r}
+gsea_res_comb_l = map(seq_along(res), function(i) {
+  res_cons = res[[i]]
+  res_cons_cur = res_cons %>% 
+    filter(contrast == "songsystem_specific") %>%
+    filter(!grepl("^LOC", gene_id))
+  rnks = res_cons_cur$t
+  names(rnks) = res_cons_cur$gene_id
+  rnks = sort(rnks)
+  gsea_res = fgsea(pathways = gmt_pathway,
+                   stats = rnks,
+                   minSize=15,
+                   maxSize=500)
+  
+  gsea_res_filt = gsea_res %>% filter(padj<.1) %>% arrange(pval)
+  collapsedPathways = collapsePathways(gsea_res_filt, pathways = gmt_pathway, stats = rnks)
+  gsea_res_ind = gsea_res %>% filter(pathway %in% collapsedPathways$mainPathways) 
+  gsea_res_np = gsea_res %>% filter(grepl("HORMONE|NEUROTR|PEPTI|DENSE_CORE", pathway))
+  gsea_res_ind = rbind(gsea_res_ind, gsea_res_np) %>% 
+    distinct(pathway, .keep_all=T) %>% 
+    arrange(-NES)
+  return(list(gsea_res, gsea_res_ind))
+})
+
+gsea_res_comb = map(gsea_res_comb_l, 1) %>% set_names(names(res)) %>% bind_rows(.id="coef")
+gsea_res_ind_comb = map(gsea_res_comb_l, 2) %>% set_names(names(res)) %>% bind_rows(.id="coef")
+```
+
+```{r}
+# gsea_res_ind_filt = gsea_res_ind %>% filter(padj<.1)
+# gsea_res_ind_top = gsea_res_ind %>% filter(padj<.1) %>%
+#   mutate(NES_abs = abs(NES)) %>%
+#   top_n(30, NES_abs) 
+# gsea_res_filt = gsea_res %>% filter(padj<.1)
+```
+
+```{r}
+# gsea_res = map(gsea_dirs, ~readRDS(file.path(.x, "gsea_res.rds"))) %>% set_names(names(sub_dirs)) %>%
+#   bind_rows(.id="coef")
+# gsea_res_ind = map(gsea_dirs, ~readRDS(file.path(.x, "gsea_res_ind.rds"))) %>% set_names(names(sub_dirs)) %>%
+#   bind_rows(.id="coef")
+```
+
+```{r}
+#gsea_res_ind_sig = gsea_res_ind %>% filter(padj<.1)
+```
+
+```{r fig.height=10}
+gsea_res_ind_select = gsea_res_ind_comb %>% 
+  mutate(p.adjust_sign = -1 * log10(padj)) %>%
+  mutate(NES_sign = sign(NES)) %>%
+  filter(padj<.1) %>% 
+  group_by(coef) %>%
+  top_n(30, abs(NES))
+  
+  gsea_res_ind_filt = gsea_res_ind_comb %>% 
+    filter(padj<.1) %>% 
+    filter(pathway %in% gsea_res_ind_select$pathway) %>%
+    distinct(coef, pathway, .keep_all=T) %>%
+    mutate(pathway = sub("^GO", "", pathway ),
+           pathway = gsub("_", " ", pathway)) %>% 
+    mutate(pathway = case_when(grepl("NONSENSE MEDIATED DECAY",pathway) ~ "NONSENSE MEDIATED DECAY",
+                               grepl("SERINE THREONINE KINASE", pathway) ~ "SERINE THREONINE KINASE SIGNALING",
+                               grepl("ADAPTIVE IMMUNE RESPONSE", pathway) ~ "ADAPTIVE  IMMUNE RESPONSE",
+                               TRUE ~ pathway))
+  
+  go_res_mat = gsea_res_ind_filt %>% select(coef, pathway, NES) %>%
+    pivot_wider(names_from = "coef", values_from = "NES", values_fill = list(NES= 0)) %>%
+    column_to_rownames("pathway") %>% as.matrix()
+  
+  hc_row = hclust(dist(go_res_mat), method="complete")
+  hc_row_order = hc_row$labels[hc_row$order]
+  
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>% 
+    mutate(leadingEdge_len = map_int(leadingEdge, length))
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>%
+    mutate(pathway = factor(pathway, levels=hc_row_order)) %>%
+    mutate(coef = factor(coef, levels=c("euth_date", "two_days", "overall_mean"))) %>%
+    complete(pathway, coef, fill=list(NES=NA, size=NA, leadingEdge_len = NA))
+  
+  size_limits = seq(round(min(gsea_res_ind_filt$size, na.rm=T), -1), round(max(gsea_res_ind_filt$size, na.rm=T), -1), by=50)
+  size_limits = seq(round(min(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), round(max(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), by=20)
+  gg = ggplot(gsea_res_ind_filt, aes(coef, pathway)) + 
+    geom_point(aes(size=leadingEdge_len, color=NES)) + 
+    scale_color_gradient2(low=muted("blue"), high=muted("red")) +
+    scale_size_continuous(range=c(.5, 3), breaks=size_limits) + 
+    labs(x = "", y ="") + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=6),
+          axis.text.y = element_text(hjust=1, size=6),
+          axis.ticks = element_line(size=.25),
+          panel.border = element_blank()) + 
+    coord_fixed()
+  print(gg)
+  ncols = ncol(go_res_mat)
+  nrows = nrow(go_res_mat)
+  
+  width = ncols / 10
+  height = nrows / 10
+  gg = set_panel_size(gg, width = unit(width, "in"), height = unit(height, "in"))
+  save_plot(file.path(out_dir, "go_terms_by_module.pdf"), gg, base_height = (width + 4), base_width = (height + 4))
+```
+
+```{r fig.height=10}
+gsea_res_ind_select = gsea_res_ind_comb %>% 
+  mutate(p.adjust_sign = -1 * log10(padj)) %>%
+  mutate(NES_sign = sign(NES)) %>%
+  filter(padj<.1) %>% 
+  filter(NES>0) %>% 
+  group_by(coef) %>%
+  top_n(20, NES)
+  
+  gsea_res_ind_filt = gsea_res_ind_comb %>%
+    filter(padj<.1) %>% 
+    filter(NES>0) %>% 
+    filter(pathway %in% gsea_res_ind_select$pathway) %>%
+    distinct(coef, pathway, .keep_all=T) %>%
+    mutate(pathway = sub("^GO", "", pathway ),
+           pathway = gsub("_", " ", pathway),
+           pathway = toupper(pathway)) %>% 
+    mutate(pathway = case_when(grepl("NONSENSE MEDIATED DECAY",pathway) ~ "NONSENSE MEDIATED DECAY",
+                               grepl("SERINE THREONINE KINASE", pathway) ~ "SERINE THREONINE KINASE SIGNALING",
+                               grepl("ADAPTIVE IMMUNE RESPONSE", pathway) ~ "ADAPTIVE IMMUNE RESPONSE",
+                               TRUE ~ pathway))
+  
+  go_res_mat = gsea_res_ind_filt %>% select(coef, pathway, NES) %>%
+    pivot_wider(names_from = "coef", values_from = "NES", values_fill = list(NES=0)) %>%
+    column_to_rownames("pathway") %>% as.matrix()
+  
+  hc_row = hclust(dist(go_res_mat), method="complete")
+  hc_row_order = hc_row$labels[hc_row$order]
+  
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>% 
+    mutate(leadingEdge_len = map_int(leadingEdge, length))
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>%
+    mutate(pathway = factor(pathway, levels=hc_row_order)) %>%
+    mutate(coef = factor(coef, levels=c("euth_date", "two_days", "overall_mean"))) %>%
+    complete(pathway, coef, fill=list(NES=NA, size=NA, leadingEdge_len = NA))
+  
+  size_limits = seq(round(min(gsea_res_ind_filt$size, na.rm=T), -1), round(max(gsea_res_ind_filt$size, na.rm=T), -1), by=50)
+  size_limits = seq(round(min(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), round(max(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), by=20)
+  
+  gg = ggplot(gsea_res_ind_filt, aes(coef, pathway)) + 
+    geom_point(aes(size=leadingEdge_len, color=NES)) + 
+    #scale_color_gradient2(low=muted("blue"), high=muted("red")) +
+    scale_color_viridis() + 
+    scale_size_continuous(range=c(.5, 3), breaks=size_limits) + 
+    labs(x = "", y ="") + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=6),
+          axis.text.y = element_text(hjust=1, size=6),
+          axis.ticks = element_line(size=.25),
+          panel.border = element_blank()) + 
+    coord_fixed()
+  print(gg)
+  ncols = ncol(go_res_mat)
+  nrows = nrow(go_res_mat)
+  
+  width = ncols / 10
+  height = nrows / 10
+  gg = set_panel_size(gg, width = unit(width, "in"), height = unit(height, "in"))
+  print(gg)
+  save_plot(file.path(out_dir, "go_terms_by_module_positive.pdf"), gg, base_width = (width + 4), base_height = (height + 4))
+```
+
+```{r}
+gsea_res_ind_select = gsea_res_ind_comb %>% 
+  mutate(p.adjust_sign = -1 * log10(padj)) %>%
+  mutate(NES_sign = sign(NES)) %>%
+  filter(padj<.1) %>% 
+  filter(NES>0) %>% 
+  group_by(coef) %>%
+  top_n(15, NES)
+  
+  gsea_res_ind_filt = gsea_res_ind_comb %>%
+    filter(coef!="overall_mean") %>% 
+    droplevels() %>% 
+    filter(padj<.1) %>% 
+    filter(NES>0) %>% 
+    filter(pathway %in% gsea_res_ind_select$pathway) %>%
+    distinct(coef, pathway, .keep_all=T) %>%
+    mutate(pathway = sub("^GO", "", pathway ),
+           pathway = gsub("_", " ", pathway),
+           pathway = toupper(pathway)) %>% 
+    mutate(pathway = case_when(grepl("NONSENSE MEDIATED DECAY",pathway) ~ "NONSENSE MEDIATED DECAY",
+                               grepl("SERINE THREONINE KINASE", pathway) ~ "SERINE THREONINE KINASE SIGNALING",
+                               grepl("ADAPTIVE IMMUNE RESPONSE", pathway) ~ "ADAPTIVE IMMUNE RESPONSE",
+                               grepl("PROTEIN LOCALIZATION TO ENDOPLASMIC RETICULUM", pathway) ~ "PROTEIN LOCALIZATION TO ER", 
+                               grepl("POSITIVE REGULATION OF PROTEIN TARGETING TO MEMBRANE", pathway) ~ "POS. REG. OF PROTEIN TARGETING TO MEMBRANE",
+                               grepl("PURINE CONTAINING COMPOUND BIOSYNTHETIC PROCESS", pathway) ~ "PURINE CONTAINING COMPOUND BIOSYNTHESIS",
+                               grepl("GENERATION OF PRECURSOR METABOLITES", pathway) ~ "GENERATION OF PRECURSOR METABOLITES",
+                               TRUE ~ pathway))
+  
+  go_res_mat = gsea_res_ind_filt %>% select(coef, pathway, NES) %>%
+    pivot_wider(names_from = "coef", values_from = "NES", values_fill = list(NES=0)) %>%
+    column_to_rownames("pathway") %>% as.matrix()
+  
+  hc_row = hclust(dist(go_res_mat), method="complete")
+  hc_row_order = hc_row$labels[hc_row$order]
+  
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>% 
+    mutate(leadingEdge_len = map_int(leadingEdge, length))
+  
+  gsea_res_ind_filt = gsea_res_ind_filt %>%
+    mutate(pathway = factor(pathway, levels=hc_row_order)) %>%
+    mutate(coef = factor(coef, levels=c("euth_date", "two_days"))) %>%
+    complete(pathway, coef, fill=list(NES=NA, size=NA, leadingEdge_len = NA))
+  
+  size_limits = seq(round(min(gsea_res_ind_filt$size, na.rm=T), -1), round(max(gsea_res_ind_filt$size, na.rm=T), -1), by=50)
+  size_limits = seq(round(min(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), round(max(gsea_res_ind_filt$leadingEdge_len, na.rm=T), -1), by=20)
+  
+  gg = ggplot(gsea_res_ind_filt, aes(coef, pathway)) + 
+    geom_point(aes(size=leadingEdge_len, color=NES)) + 
+    #scale_color_gradient2(low=muted("blue"), high=muted("red")) +
+    scale_color_viridis() + 
+    scale_size_continuous(range=c(.5, 3), breaks=size_limits) + 
+    labs(x = "", y ="") + 
+    theme_bw() + 
+    theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=6),
+          axis.text.y = element_text(hjust=1, size=6),
+          axis.ticks = element_line(size=.25),
+          panel.border = element_blank()) + 
+    coord_fixed()
+  print(gg)
+  ncols = ncol(go_res_mat)
+  nrows = nrow(go_res_mat)
+  
+  width = ncols / 5
+  height = nrows / 10
+  gg = set_panel_size(gg, width = unit(width, "in"), height = unit(height, "in"))
+  print(gg)
+  save_plot(file.path(out_dir, "go_terms_by_module_positive_no_mean.pdf"), gg, base_width = (width + 4), base_height = (height + 4))
+```
+
