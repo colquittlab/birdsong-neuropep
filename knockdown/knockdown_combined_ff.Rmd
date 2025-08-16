@@ -1,0 +1,1737 @@
+
+```{r}
+library(R.matlab)
+library(stringr)
+library(parallel)
+library(lubridate)
+library(Cairo)
+source("~/src/songanalysis/song_util.R")
+source("~/src/songanalysis/song_db.R")
+source("~/src/songanalysis/song_ff.R")
+source("~/src/songanalysis/deafen_plot.R")
+source("~/src/songanalysis/song_plot.R")
+source("~/data2/rstudio/birds/utils/dialysis.R")
+source("~/data2/rstudio/birds/utils/hvc.R")
+source("~/data2/rstudio/birds/utils/db.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+
+source("~/data2/rstudio/birds/utils/mixed_model2.R")
+library(tidyverse)
+library(broom)
+library(broomExtra)
+library(here)
+library(cowplot)
+library(lmerTest)
+library(car)
+library(feather)
+library(furrr)
+```
+
+```{r}
+registerDoMC(cores=6)
+```
+
+```{r}
+filter = dplyr::filter
+summarize = dplyr::summarize
+mutate = dplyr::mutate
+select = dplyr::select
+here = here::here
+map = purrr::map
+```
+
+# Load info 
+```{r}
+prefix_song = "/mnt/bengal_home/song"
+prefix_data = "~/data2/rstudio/birds/deafen/song_analysis/knockdown/"
+script_name = "knockdown_combined_ff"
+out_dir = file.path(prefix_data, script_name)
+dir.create(out_dir)
+```
+
+```{r}
+birds = c( 
+   "rd37rd56", "bu82wh76", "bu33or29", "or53or14", # control
+  "rd23gr10", "pu30bk80", "wh20pk99", "rd35rd54",  "or83or25", # CRHBP
+  "rd84gr50","rd25gr70",   "bu88bu26", "or45pu98" # CRH
+)
+
+#birds_to_exclude = c("pu17bk34", "rd37rd56") # large gliosis scars in RA
+```
+
+```{r}
+db_sub_dirs = purrr::map(birds, ~file.path(prefix_data, .x, sprintf("%s.db", .x))) %>%
+  set_names(birds)
+#data_dir = file.path(prefix_data, "combined_crh")
+#dir.create(data_dir)
+#plot_dir = paste(data_dir, "figures", sep="/")
+#dir.create(plot_dir, recursive=T)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+options(httr_oob_default=TRUE)
+dates_to_proc = list(c("songs"))
+dial_log = load_knockdown_gs(birds)
+info = map(birds, function(x) {
+  print(x)
+  load_song_info_event(x, "songs", subdir="", log_data=dial_log, tz="PDT")
+}) %>%
+  bind_rows()
+info = info %>% distinct(wav, .keep_all=T)
+```
+
+### Group siRNAs
+```{r}
+sirna_groups = data.frame(log.sirna = c("none", "SLC17A6", "control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                          log.sirna2 = c("none", "SLC17A6", "control", "CRHBP", "CRHBP", "CRH"))
+info = info %>% left_join(sirna_groups)
+```
+
+### Metadata cleanup
+```{r}
+info = info %>% mutate(period = if_else(rel_date<= 0, "PRE", "POST"))
+info = info %>% mutate(wav_base = basename(wav),
+                        mat_base = basename(mat))
+## Remove double backslashes
+info = info %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+```
+
+# Load features
+```{r}
+reload=F
+tname3 = "syls"
+syls_fname = file.path(out_dir, "syls.feather")
+
+if (reload) {
+  base_dir = "/mnt/bengal_home/song/%s/songs/autolabel"
+
+  data_dirs = map(unique(info$bird), ~sprintf(base_dir, .x))
+  data_files = map(data_dirs, function(x) {
+    list.files(x, pattern=".db$", full.names = T)
+  })
+
+  features = map(data_files, load_hvc_db)
+  syls = bind_rows(features)
+  write_feather(syls, syls_fname)
+} else {
+  syls = read_feather(syls_fname)
+}
+  #redo = F
+  #if (redo && dbExistsTable(db, tname3))
+  #  dbRemoveTable(db, tname3)
+  #dbWriteTable(db, tname3, syls, temporary=F)
+#} else {
+#  syls = collect(tbl(db, tname3), n=Inf)
+#}
+```
+
+# Plotting
+```{r}
+colors = c("grey40", "darkred", "grey40", "navy", "darkgreen" )
+names(colors) = c("intact", "deaf", "control", "CRH", "CRHBP")
+```
+
+```{r}
+hl = geom_hline(yintercept=0, linetype=3)
+th = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1),
+                        strip.text.y = element_text(angle=0))
+li = ylim(-6, 6)
+scc = scale_color_manual("", values=c("red", "black", "blue"))
+scx = scale_x_datetime(date_breaks="4 hours", 
+                   labels=date_format("%m-%d %H:%M",
+                                      tz="America/Los_Angeles"))
+gu = guides(colour = guide_legend(override.aes = list(alpha=1)))
+xl = xlab("")
+yl = ylab("Z-score")
+fig_width=8
+fig_height=8
+
+ggp = geom_point(alpha=.1, position=position_jitter(width=.2))
+gf =  facet_grid(labels~expt)
+gth = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust = 1))
+gli =  ylim(-4, 4)
+ghl = geom_hline(yintercept=0, linetype=2)
+gxl = xlab("")
+```
+
+```{r}
+plot_across_time_current = function(data, value, drug_times1) {
+  gg = plot_within_day(data , value, 
+                       x_value = "rel_mtime",
+                       #datetime_sections = drug_times1,
+                       group_factor = NULL,
+                       facet_factor = "labels", 
+                       color_factor =  NULL, 
+                       alpha=.1, 
+                       raster_points = F)
+  #gg = gg + facet_grid(labels~expt, scales="free_x")
+  gg = gg + th + gu + xl + yl + scc
+  gg = gg + labs(title=value)
+  gg
+}
+```
+
+
+# Frequency
+```{r}
+
+info1 = info %>% filter(rel_date>=-4)
+
+wl = 1024
+
+
+tname_default = sprintf("ff3_%s", wl)
+tnames = rep(tname_default, times=length(db_sub_dirs))
+
+names(tnames) = db_sub_dirs
+tnames[grepl("or83or25", names(tnames))] = "ff3_1024_params2"
+
+
+ffreq = map(db_sub_dirs, function(x) {
+  print(x)
+  db_sub = dbConnect(RSQLite::SQLite(), x)
+  collect(tbl(db_sub, tnames[[x]]), n=Inf)
+}) %>% set_names(names(db_sub_dirs)) %>% bind_rows(.id="bird")
+
+#ffreq = ffreq %>% distinct(id, bird, .keep_all=T)
+
+
+## To fix or99pu57 to or45pu98 labeling error
+ffreq = ffreq %>% mutate(mat = gsub("or99pu57", "or45pu98", mat),
+                         wav = gsub("or99pu57", "or45pu98", wav))
+## Remove double backslashes
+ffreq = ffreq %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+ffreq = ffreq %>% filter(wav %in% info$wav)
+``` 
+
+```{r}
+ffreq1 = ffreq %>% left_join(info)
+ffreq1 = ffreq1 %>% left_join(syls %>% dplyr::select(wav, onsets, labels, pred_ent))
+ffreq1 = ffreq1 %>% mutate(mtime_onsets = mtime + seconds(onsets))
+#ffreq1 = ffreq1 %>% filter(pred_ent<.5)
+```
+
+## Summaries
+```{r}
+min_date = -2
+max_date = 8
+```
+
+```{r}
+ffreq1_stats = ffreq1 %>%
+  group_by(labels, bird) %>% 
+  summarize(mean_ff = mean(ff, na.rm=T), sd_thresh = 5 * sd(ff, na.rm=T)) %>% 
+  mutate(freq_lower = mean_ff- sd_thresh,
+         freq_upper = mean_ff + sd_thresh)
+
+ffreq1 = ffreq1 %>% 
+  left_join(ffreq1_stats)
+
+ffreq1 = ungroup(ffreq1) %>% filter(ff > freq_lower, ff < freq_upper)
+```
+
+## Rolling CV
+```{r}
+ffreq1 = ffreq1 %>% group_by(bird, labels, rel_date) %>% arrange(mtime_onsets) %>% do({
+  d = .
+  res = calc_rolling_func(d$ff, 5, direction = "backward")
+  res11 = calc_rolling_func(d$ff, 11, direction = "backward")
+  res51 = calc_rolling_func(d$ff, 51, direction = "backward")
+  data.frame(., ff_cv=res, ff_cv11 = res11, ff_cv51 = res51)
+})
+```
+
+## Z score
+```{r}
+vars_to_process = c("ff", "mean_ff", "ff_cv", "ff_cv11", "ff_cv51")
+# ffreq1_base = ffreq1 %>% 
+#   mutate(period = if_else(rel_date > 0, "POST", "PRE")) %>% 
+#   group_by(labels, bird, period) %>% 
+#   summarize_at(vars(vars_to_process), list(mean_base = mean)) %>%
+#   ungroup() %>% 
+#   filter(period=="PRE") %>%
+#   select(-period)
+
+perc_change_cust = function(d, drel=NULL, baseline=NULL) {
+  if (is.null(drel) & !is.null(baseline)) {
+    drel = d[baseline]
+  }
+  baseline_mean =  mean(drel, na.rm=T)
+  #print(baseline_mean)
+  100 * (d - baseline_mean) / baseline_mean
+}
+
+
+ffreq1 = ffreq1 %>%
+  ungroup() %>% 
+ # left_join(ffreq1_base)
+  mutate(baseline = rel_date==0) %>%
+  group_by(labels, bird) %>% 
+  do({
+    d = .
+    #print(d$bird[1])
+    #print(d$labels[1])
+   d = d %>% mutate_at(vars(all_of(vars_to_process)),    
+                        list(z = "zscore_my",
+                                  perc = "perc_change"), baseline=d$baseline)
+  })
+```
+
+```{r}
+
+ffreq1_n = ffreq1 %>% group_by(bird, labels, rel_date) %>% summarize(n=n())
+
+ffreq2 = ffreq1 %>% 
+  filter(rel_date>=min_date, rel_date<=max_date) %>%
+  left_join(ffreq1_n) %>% 
+  filter(n>=60) %>% 
+  group_by(labels, period, rel_date, bird) %>%
+  summarize(ff_mean = mean(ff),
+            ff_cv = calc_cv(ff)) %>% 
+  ungroup() %>%
+  group_by(labels, bird) %>%
+  do({
+    d = .
+    d = d %>% mutate(baseline = rel_date<0)
+    d %>% mutate_at(c("ff_mean", "ff_cv"), list(z = "zscore_my", perc = "perc_change"), baseline=d$baseline)
+  })
+
+ffreq2 = ffreq2 %>% ungroup() %>% mutate(period = factor(period, levels=c("PRE", "POST")))
+
+ffreq2 = ffreq2 %>% left_join(info) %>%
+  distinct(labels, period, bird, rel_date, .keep_all=T) %>% mutate(period = factor(period, levels=c("PRE", "POST")))
+```
+
+
+## Within bout CV
+```{r}
+ffreq_cv_bout = ffreq1 %>% group_by(bird, labels, wav, period) %>% arrange(mtime_onsets) %>% 
+  summarize(ff_cv = calc_cv(ff))
+ffreq_cv_bout = ffreq_cv_bout %>% group_by(labels) %>% 
+  mutate(ff_cv_z = zscore_my(ff_cv, ff_cv[period=="PRE"]),
+         ff_cv_perc = 100 * (ff_cv - mean(ff_cv[period=="PRE"])) / mean(ff_cv[period=="PRE"]))
+
+ffreq_cv_bout = ffreq_cv_bout %>%
+  left_join(info) %>%
+  ungroup() #%>% mutate(expt = factor(expt, levels=drug_date$expt)) %>% group_by(expt)
+```
+## Across time 
+```{r}
+time_dir = file.path(out_dir, "across_time")
+dir.create(time_dir)
+```
+
+```{r message=FALSE, warning=FALSE}
+values = c("ff_z", "ff")
+walk(values, function(value) {
+  walk(birds, function(bird_cur) {
+    print(bird_cur)
+    ffreq1_cur = ffreq1 %>% filter(bird==bird_cur)
+    ff_labels = unique(ffreq1_cur$labels)
+    walk(ff_labels, function(label) {
+      ffreq1_cur2 = ffreq1_cur %>% filter(labels==label)
+      ndays = length(unique(ffreq1_cur2$rel_date))
+      gg = plot_across_time_current(ffreq1_cur2, value) +
+        #scale_color_manual(values=colors) + 
+        stat_smooth(se=F, fullrange=F, span=.5, method="loess") + 
+        labs(title=label, y= "FF (Z-score)") +
+        geom_hline(yintercept=0, linetype=2)
+      save_plot(file.path(time_dir, sprintf("%s_%s_%s_time.pdf", value, bird_cur, label)), gg, base_height = 3, base_width = ndays  / 2 )
+    })
+    
+  })
+})
+```
+
+### FF CV
+```{r}
+plan(multisession(workers = 10))
+```
+
+```{r message=FALSE, warning=FALSE}
+values = c("ff_cv_z", "ff_cv11_z", "ff_cv_perc", "ff_cv11_perc")
+
+ffreq1_filt = ffreq1 %>%
+    filter(rel_date >= min_date, rel_date <= max_date)
+walk(values, function(value) {
+  min_y = min(ffreq1_filt[,value])
+  max_y = max(ffreq1_filt[,value])
+  ffreq1_birds = split(ffreq1_filt, ffreq1_filt$bird)
+  future_walk(ffreq1_birds, function(ffreq1_cur) {
+    #print(bird_cur)
+    bird_cur = ffreq1_cur$bird[1]
+    ff_labels = unique(ffreq1_cur$labels)
+    walk(ff_labels, function(label) {
+      ffreq1_cur2 = ffreq1_cur %>% filter(labels==label)
+      ndays = length(unique(ffreq1_cur2$rel_date))
+      gg = plot_across_time_current(ffreq1_cur2, value) +
+        #scale_color_manual(values=colors) + 
+        stat_smooth(se=F, fullrange=F, span=.5, method="loess") + 
+        labs(y= "FF CV (Z-score)") +
+        scale_x_continuous(breaks=seq(min_date, max_date, 2)) +
+        ylim(c(min_y, max_y)) + 
+        geom_hline(yintercept=0, linetype=2)
+      save_plot(file.path(time_dir, sprintf("%s_%s_%s_time.pdf", value, bird_cur, label)), gg, base_height = 3, base_width = ndays  / 2 )
+    })
+    
+  })
+})
+```
+
+```{r}
+values = c("ff_cv_z", "ff_cv11_z")
+walk(values, function(value) {
+walk(ff_labels, function(label) {
+  tmp = ffreq_cv %>% filter(labels==label, expt %in% filts)
+  n_expts = length(unique(as.character(tmp$expt)))
+  ncolumns = 5
+  nrows = ceiling(n_expts / ncolumns)
+  gg = plot_across_time_current(tmp, value)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + facet_wrap(~expt)
+  gg = gg + ylim(-5, 5)
+  #gg = gg + ylim(0, .03)
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV (Z-score)")
+  print(gg)
+  save_plot(file.path(time_dir, sprintf("%s_%s_time.pdf", value, label)), gg, base_width=1.5, base_height=1.5, ncol=ncolumns, nrow=nrows)
+  #ggsave(paste(time_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+})
+
+values = c("ff_cv", "ff_cv11")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv %>% filter(labels==label, expt %in% filts)
+    n_expts = length(unique(as.character(tmp$expt)))
+  ncolumns = 5
+  nrows = ceiling(n_expts / ncolumns)
+    gg = plot_across_time_current(tmp, value)
+    gg = gg + scale_color_manual(values=colors)
+    gg = gg + facet_wrap(~expt)
+    #gg = gg + ylim(0, .03)
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV")
+    print(gg)
+     save_plot(file.path(time_dir, sprintf("%s_%s_time.pdf", value, label)), gg, base_width=2, base_height=2, ncol=ncolumns, nrow=nrows)
+  })
+})
+
+values = c("ff_cv")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv_bout %>% filter(labels==label, expt %in% filts)
+    n_expts = length(unique(as.character(tmp$expt)))
+  ncolumns = 5
+  nrows = ceiling(n_expts / ncolumns)
+    gg = plot_across_time_current(tmp, value)
+    gg = gg + scale_color_manual(values=colors)
+    gg = gg + facet_wrap(~expt)
+    gg = gg + ylim(0, .06)
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV")
+    print(gg)
+     save_plot(file.path(time_dir, sprintf("%s_%s_bout_time.pdf", value, label)), gg, base_width=2, base_height=2, ncol=ncolumns, nrow=nrows)
+  })
+})
+
+values = c("ff_cv", "ff_cv11")
+walk(values, function(value) {
+walk(ff_labels, function(label) {
+  tmp = ffreq_cv %>% group_by(expt) %>% filter(labels==label) %>%
+    filter(expt %in% filts)
+  total_days = as.numeric(max(tmp$date) - min(tmp$date))
+  gg = ggplot(tmp , aes_string("mtime_onsets", value))
+  gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+  #gg = plot_across_days(ffreq1 %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label, y="FF CV", x ="")
+  gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+  gg = gg + ylim(0, .06)
+  print(gg)
+  save_plot(paste(across_days, sprintf("%s_%s_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days)
+  
+  gg = ggplot(tmp , aes_string("mtime_onsets", value))
+  gg = gg + geom_point(aes(color=log.drug), alpha=.01)
+  #gg = plot_across_days(ffreq1 %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+  gg = gg + labs(title=label, y="FF CV", x ="")
+  gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+  gg = gg + ylim(0, .06)
+  gg = gg + theme(panel.grid.major.y = element_line(color="grey"))
+  print(gg)
+  save_plot(paste(across_days, sprintf("%s_%s_span1_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days)
+ # ggsave(paste(across_days, sprintf("%s_%s_days.pdf", value, label),sep="/"), width=20, height=4 )
+})
+})
+
+values = c("ff_cv")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv_bout %>% group_by(expt) %>% filter(labels==label) %>%
+      filter(expt %in% filts)
+    total_days = as.numeric(max(tmp$date) - min(tmp$date))
+    gg = ggplot(tmp , aes_string("mtime", value))
+    gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+    #gg = plot_across_days(ffreq1 %>% filter(labels==label), value)
+    gg = gg + scale_color_manual(values=colors)
+    #gg = gg + facet_wrap(~expt, scales="free_x")
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=label, y="FF within bout CV", x ="")
+    gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+    gg = gg + ylim(0, .06)
+    print(gg)
+    save_plot(paste(across_days, sprintf("%s_%s_bout_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days)
+  })
+})
+
+```
+## Summary plots
+```{r}
+values = c("ff_mean_z", "ff_cv_z", "ff_mean_perc", "ff_cv_perc")
+values_form = c("FF", "FF CV", "FF", "FF CV")
+values_form = data.frame(val = values, title = values_form, ylab = rep(c("Z-score from pre knockdown", "% change from pre knockdown"), each=2))
+```
+
+### FF density
+```{r}
+tmp = ffreq1 %>% 
+  filter(rel_date>=-2, rel_date<=6) %>%
+  filter(bird %in% c("wh20pk99", "rd25gr70", "bu82wh76")) %>%
+  filter(!(bird=="wh20pk99" & labels=="b")) %>%
+#  filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>%
+  #filter(!(bird=="rd84gr50" & labels %in% c("d"))) %>% 
+  group_by(bird) %>% 
+  mutate(labels1 = as.numeric(factor(labels))) %>%
+  mutate(rel_date1 = if_else(rel_date<=0, "PRE", as.character(rel_date))) %>%
+  group_by(bird, labels1, rel_date) %>% 
+  mutate(ff_zero = ff - mean(ff),
+         ff_z_zero = ff_z - mean(ff_z))
+
+tmp_n = tmp %>% group_by(bird, labels, rel_date1) %>% summarize(n=n())
+tmp = tmp %>% left_join(tmp_n) %>%
+  filter(n>=60)
+days = unique(tmp$rel_date1)
+
+npre_days = sum(days<=0)
+npost_days = sum(days>0)
+
+ncols = length(unique(tmp$labels1)) + 1
+nrows = length(unique(tmp$bird))
+
+#colors = c(rep("grey", times=npre_days), colorRampPalette(c("grey", "darkgreen"))(npost_days))
+colors =  colorRampPalette(c("grey", "darkgreen"))(npost_days+1)
+names(colors) = days
+gg = ggplot(tmp, aes(ff_z, color=as.factor(rel_date1)))
+gg = gg + geom_density()
+gg = gg + scale_color_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(bird~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+
+save_plot(file.path(out_dir, "ff_z_density_by_day_example.pdf"), gg, base_height=3, base_aspect_ratio = 1.1, ncol=ncols, nrow=nrows)
+
+gg = ggplot(tmp, aes(ff_z_zero, color=as.factor(rel_date1)))
+gg = gg + geom_density()
+gg = gg + scale_color_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(bird~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+save_plot(file.path(out_dir, "ff_z_zero_density_by_day_example.pdf"), gg, base_height=3, base_aspect_ratio = .75, ncol=ncols, nrow=nrows)
+
+tmp1 = tmp %>% filter(rel_date %in% c(-2, -1, 3, 4, 5)) %>%
+  mutate(period = factor(period, levels=c("PRE", "POST"), labels=c("pre-injection", "post-injection"))) %>%
+  group_by(period, bird, labels1) %>%
+  mutate(ff_zero = ff - mean(ff),
+         ff_z_zero = ff_z - mean(ff_z)) %>%
+   mutate(log.sirna = factor(log.sirna, 
+                                        levels = c("control", "CRHBP (1-3)", "CRH (set1)"),
+                                        labels=c("control", "CRHBP", "CRH")))
+
+ncols = length(unique(tmp$labels1)) + 1
+nrows = length(unique(tmp1$log.sirna))
+
+gg = ggplot(tmp1, aes(ff, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(bird~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+
+save_plot(file.path(out_dir, "ff_density_by_period.pdf"), gg, base_height=1.5, base_aspect_ratio = .75, ncol=ncols, nrow=nrows)
+
+gg = ggplot(tmp1, aes(ff_z, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(log.sirna~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz), Z-scored")
+gg
+ncols = length(unique(ffreq1$labels)) + 1
+nrows = length(unique(tmp1$log.sirna))
+save_plot(file.path(out_dir, "ff_z_density_by_period.pdf"), gg, base_height=1, base_aspect_ratio = .75, ncol=ncols, nrow=nrows)
+
+
+gg = ggplot(tmp1, aes(ff_zero, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(log.sirna~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz), mean-subtracted")
+gg
+
+save_plot(file.path(out_dir, "ff_zero_density_by_period.pdf"), gg, base_height=1, base_aspect_ratio = .75, ncol=ncols, nrow=nrows)
+
+gg = ggplot(tmp1, aes(ff_z_zero, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(log.sirna~labels1, scales="free_x")
+gg = gg + labs(x="FF (kHz), mean-subtracted")
+gg
+
+save_plot(file.path(out_dir, "ff_z_zero_density_by_period.pdf"), gg, base_height=1, base_aspect_ratio = .75, ncol=ncols, nrow=nrows)
+
+
+
+
+
+```
+
+### FF group
+```{r}
+tmp = ffreq2 %>% 
+  group_by(bird) %>% 
+  mutate(labels1 = as.numeric(factor(labels))) %>%
+  mutate(rel_date1 = if_else(rel_date<0, "PRE", as.character(rel_date))) %>%
+   filter(rel_date1 %in% c("PRE", "2", "3", "4", "5", "6", "7")) %>%
+  group_by(period, bird, labels, log.sirna) %>%
+  summarize(ff_mean_z = mean(ff_mean_z),
+            ff_mean_perc = mean(ff_mean_perc)) %>% 
+  mutate(bird_labels = paste(bird, labels, sep = "-")) 
+
+tmp = tmp %>% mutate(log.sirna = factor(log.sirna, 
+                                        levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                                        labels=c("control", "CRHBP", "CRHBP", "CRH")))
+
+
+gg = ggplot(tmp, aes(period, ff_mean_z, color=bird_labels))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_mean_perc, color=bird_labels))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_mean_perc, color=log.sirna))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_wrap(~bird)
+gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_mean_z, color=log.sirna))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_wrap(~bird)
+#gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+
+gg = ggplot(tmp, aes(period, ff_mean_perc, color=bird))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+#gg = gg + ylim(-40, 125)
+
+gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline")
+gg
+save_plot(file.path(out_dir, "ff_mean_period_mean.pdf"), gg, base_height=3, base_aspect_ratio = .8, ncol=3, nrow=1)
+```
+```{r}
+tmp = ffreq2 %>%
+  #filter(!(bird %in% c("bu88bu26"))) %>% 
+  group_by(bird) %>% 
+  mutate(labels1 = as.numeric(factor(labels))) %>%
+  mutate(rel_date1 = if_else(rel_date<0, "PRE", as.character(rel_date))) %>%
+  filter(rel_date1 %in% c("PRE", "2", "3", "4", "5", "6", "7")) %>%
+  mutate(log.sirna2 = factor(log.sirna, 
+                                        levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                                        labels=c("control", "CRHBP", "CRHBP", "CRH"))) %>% 
+  group_by(period, log.sirna2, bird) %>%
+  summarize_at(vars(ff_mean_z, ff_mean_perc), funs(mean, sd, sem))
+
+tmp2 = tmp %>% 
+  ungroup() %>%
+  group_by(period, log.sirna2) %>%
+  summarize_at(vars(ff_mean_z_mean, ff_mean_perc_mean), funs(mean, sd, sem)) #%>%
+  #mutate(bird_labels = paste(bird, labels, sep = "-")) 
+# tmp = tmp %>% mutate(log.sirna = factor(log.sirna, 
+#                                         levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+#                                         labels=c("control", "CRHBP", "CRHBP", "CRH")))
+
+gg = ggplot(tmp2, aes(period, ff_mean_perc_mean_mean))
+gg = gg + geom_pointrange(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem)))
+gg = gg + geom_line(aes(group=log.sirna2))
+gg = gg + facet_grid(.~log.sirna2)
+#gg = gg + ylim(-40, 125)
+#gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline")
+gg
+save_plot(file.path(out_dir, "ff_mean_period_mean_mean.pdf"), gg, base_height=2.5, base_aspect_ratio = .6, ncol=3, nrow=1)
+
+gg = ggplot(tmp2, aes(period, ff_mean_z_mean_mean))
+gg = gg + geom_pointrange(aes(ymin=(ff_mean_z_mean_mean - ff_mean_z_mean_sem), ymax=(ff_mean_z_mean_mean + ff_mean_z_mean_sem)))
+gg = gg + geom_line(aes(group=log.sirna2))
+gg = gg + facet_grid(.~log.sirna2)
+#gg = gg + ylim(-40, 125)
+#gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, Z-score to baseline")
+gg
+save_plot(file.path(out_dir, "ff_mean_z_period_mean_mean.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=3, nrow=1)
+```
+
+```{r}
+
+gg = ggplot(tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean_mean, color=log.sirna2)) +
+  geom_pointrange(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+gg = ggplot() +
+  geom_point(data = tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean_mean, color=log.sirna2)) + 
+  geom_point(data = tmp %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean), color="grey", position = position_jitter(), size=1) + 
+ # geom_pointrange(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+
+gg = ggplot(tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean_mean)) + 
+  geom_bar(stat="identity", aes(fill=log.sirna2), alpha=.5) +
+  geom_errorbar(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem)), width=0) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline") + 
+  scale_color_manual(values=colors) + 
+  scale_fill_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_bar.pdf"), gg, base_height=3, base_aspect_ratio = .75, ncol=1, nrow=1)
+```
+
+```{r}
+tmp = ffreq2 %>% filter(bird=="wh20pk99")
+gg =ggplot(tmp, aes(rel_date, ff_mean_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="or46pu99")
+gg =ggplot(tmp, aes(rel_date, ff_mean_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="or46pu99")
+gg =ggplot(tmp, aes(rel_date, ff_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="pu17bk34")
+gg =ggplot(tmp, aes(rel_date, ff_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+```
+
+
+```{r}
+plot_grouped_across_time2 = function(dat, value, values_form) {
+  print(value)
+  values_form_cur = values_form %>% filter(val == value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", value, color="bird")) 
+  gg = gg + geom_point(position = position_jitter(width=.2))
+  gg = gg + facet_grid(log.sirna~.)
+  #gg = gg + ylim(values_form_cur$ymin[1], values_form_cur$ymax[1])
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+ffreq2_filt= ffreq2 #%>% 
+  #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+  #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>%
+  #filter(!(bird=="rd84gr50" & labels %in% c("d")))
+plot_grouped_across_time2(ffreq2_filt, "ff_mean_perc", values_form)
+```
+
+```{r}
+walk(values, function(value) {
+  plot_grouped_across_time2(ffreq2_filt, value, values_form)
+})
+```
+
+```{r}
+#vars_cur_z_mean = paste(vars_cur_z, "_mean", sep="")
+#up = function(x,y) {x+y}
+#low = function(x,y) {x-y}
+ffreq1 = ffreq2 %>%
+  # filter(!(bird=="wh20pk99" & labels=="b")) %>%
+  # filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>% 
+   filter(!(bird %in% c("pu17bk34"))) %>% 
+ # filter(!(bird %in% c("or95bk93"))) %>% 
+   filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23"))) %>% # extensive gliosis by
+  group_by(rel_date, bird, log.sirna) %>% summarize_at(vars(values), list(mean="mean_na", sem="sem_na", sd="sd_na")) 
+```
+
+```{r}
+plot_grouped3_across_time = function(dat, value, values_form) {
+  print(value)
+    values_form_cur = values_form %>% filter(val == value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+  
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+   gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+   gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s_line.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  #return(gg)
+  print(gg)
+}
+
+value = "ff_mean_z"
+plot_grouped3_across_time(ffreq2, value, values_form)
+
+```
+
+```{r}
+walk(values, ~plot_grouped3_across_time(ffreq1, .x, values_form))
+```
+```{r}
+plot_grouped3_across_time_lims = function(dat, value, values_form) {
+  print(value)
+    values_form_cur = values_form %>% filter(val == value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+  
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+   gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  
+  if (grepl("z", value)) {
+  gg = gg + lims(y=c(-10, 10))
+  } else if (grepl("perc", value)) {
+    gg = gg + lims(y=c(-50, 50)) 
+  }
+  value_trim = sub("_mean$", "", value)
+   gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s_line_lims.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  #return(gg)
+  print(gg)
+}
+walk(values, ~plot_grouped3_across_time_lims(ffreq1, .x, values_form))
+
+```
+
+#### Hypothesis testing
+```{r}
+group_modeling_dir = file.path(out_dir, "models")
+dir.create(group_modeling_dir)
+```
+
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+
+#### Grouped 
+```{r message=FALSE, warning=FALSE}
+redo = F
+
+#min_date = -2
+#max_date = 8
+fname = file.path(group_modeling_dir, "relative_to_baseline_ff_grouped.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+
+    tmp = dat %>% 
+      rename(value = !!as.symbol(value))
+    
+    tmp %>% 
+      group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = ffreq2 %>% group_by(bird, rel_date, log.sirna, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  
+  post_rel_dates = 2:7
+  
+  cur = ffreq2 %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna = factor(log.sirna)) %>%
+    # inner_join(nsyls) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH")) %>%
+    filter(rel_date %in% post_rel_dates | period=="PRE") %>%
+    mutate(period = factor(period, levels=c("PRE", "POST"))) #%>% 
+ #   filter(!(bird %in% c("bu88bu26"))) 
+    #filter(!(bird %in% c("pu17bk34", "or95bk93"))) %>%
+    #filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23")))# %>% # extensive gliosis by
+    #filter(bird != "rd23gr10")
+    #filter(bird != "or83or25")
+    #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+    #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) #%>%
+    #filter(!(bird=="bu88bu26" & labels %in% c("d", "w", "e")))# %>% 
+  
+  
+  des = value ~ period + (1  | bird / labels)
+
+  values1 = c("ff_mean_z", "ff_mean_perc", "ff_mean")
+  
+  mods = map(values1, function(x) {
+    cur1 = cur# %>% 
+      #group_by(bird, period, log.sirna, labels) %>%
+      #sample_n(200) %>%
+      #ungroup()
+    run_lmer_model(cur1, des, x)
+    
+  }) %>% 
+    set_names(values1) %>%
+    bind_rows(.id="variable")
+  
+
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="period") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() #%>%
+  #mutate(rel_date = as.numeric(rel_date))
+mods_p
+```
+
+```{r}
+mods %>% filter(level=="fixed", coef=="periodPOST")
+```
+
+```{r}
+tmp = mods %>% filter(level=="fixed", coef=="periodPOST") %>%
+  pivot_wider(names_from = coef_type, values_from = "value") %>%
+  mutate(log.sirna2 = factor(log.sirna2, 
+                             levels = c("control", "CRHBP", "CRH")))
+
+colnames(tmp) = make.names(colnames(tmp))
+
+tmp2 = tmp %>% 
+    filter(variable=="ff_mean_perc") 
+
+gg = ggplot(tmp2, aes(log.sirna2, Estimate, color=log.sirna2)) +
+  geom_pointrange(aes(ymin=(Estimate - Std..Error), ymax=(Estimate + Std..Error))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_point_model.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+
+# gg = ggplot(tmp2) +
+#   geom_point(data = tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean_mean, color=log.sirna2)) + 
+#   geom_point(data = tmp %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean), color="grey", position = position_jitter(), size=1) + 
+#  # geom_pointrange(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem))) +
+#   geom_hline(yintercept=0, linetype=2) +
+#   theme(legend.position="none") +
+#   labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+#   scale_color_manual(values=colors)
+# gg
+# save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+## Current Fig 7F
+gg = ggplot(tmp2, aes(log.sirna2, Estimate)) + 
+  geom_bar(stat="identity", aes(fill=log.sirna2), alpha=.5) +
+  geom_errorbar(aes(ymin=(Estimate - Std..Error), ymax=(Estimate + Std..Error)), width=0) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline") + 
+  scale_color_manual(values=colors) + 
+  scale_fill_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_bar_model.pdf"), gg, base_height=3, base_aspect_ratio = .75, ncol=1, nrow=1)
+```
+
+#### Grouped  - relative to control
+```{r message=FALSE, warning=FALSE}
+redo = F
+
+#min_date = -2
+#max_date = 8
+fname = file.path(group_modeling_dir, "relative_to_baseline_ff_grouped.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+
+    tmp = dat %>% 
+      rename(value = !!as.symbol(value))
+    
+    tmp %>% 
+     # group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = ffreq2 %>% group_by(bird, rel_date, log.sirna, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  
+  post_rel_dates = 2:6
+  
+  cur = ffreq2 %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna = factor(log.sirna)) %>%
+    # inner_join(nsyls) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH")) %>%
+    filter(rel_date %in% post_rel_dates | period=="PRE") %>%
+    mutate(period = factor(period, levels=c("PRE", "POST"))) #%>% 
+ #   filter(!(bird %in% c("bu88bu26"))) 
+    #filter(!(bird %in% c("pu17bk34", "or95bk93"))) %>%
+    #filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23")))# %>% # extensive gliosis by
+    #filter(bird != "rd23gr10")
+    #filter(bird != "or83or25")
+    #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+    #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) #%>%
+    #filter(!(bird=="bu88bu26" & labels %in% c("d", "w", "e")))# %>% 
+  
+  
+  des = value ~ log.sirna2 + (1  | bird / labels)
+
+  values1 = c("ff_mean_z", "ff_mean_perc", "ff_cv_z", "ff_cv_perc", "ff_cv")
+  
+  to_test = c("CRHBP", "CRH")
+  mods = map(values1, function(x) {
+    map(to_test, function(group_to_test) {
+      print(group_to_test)
+    cur1 = cur %>%
+      filter(log.sirna2 %in% c("control", group_to_test))
+      #group_by(bird, period, log.sirna, labels) %>%
+      #sample_n(200) %>%
+      #ungroup()
+    run_lmer_model(cur1, des, x)
+    }) %>% set_names(to_test) %>% bind_rows(.id="log.sirna2")
+  }) %>% 
+    set_names(values1) %>%
+    bind_rows(.id="variable")
+  
+
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="log.sirna2") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() #%>%
+  #mutate(rel_date = as.numeric(rel_date))
+mods_p
+```
+
+```{r}
+mods %>% filter(level=="fixed", coef=="log.sirna2CRH", coef_type=="Estimate")
+```
+
+
+### FF CV group
+```{r}
+tmp = ffreq2 %>% 
+  #filter(rel_date>=-4, rel_date<=5) %>%
+#  filter(bird %in% c("wh20pk99", "pu17bk34", "rd25gr70", "rd84gr50", "pu30bk80", "or46pu99")) %>%
+ # filter(!(log.sirna) %in% c("none", "SLC17A6")) %>% 
+#  filter(!(bird %in% c("pu17bk34", "or95bk93"))) %>% # extensive gliosis by histology, control
+#    filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23"))) %>% # extensive gliosis by histology, CRH
+ # filter(!(bird %in% c("bu88bu26"))) %>% 
+  #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+  #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>%
+  #filter(!(bird=="bu88bu26" & labels %in% c("d", "w", "e"))) %>% 
+#  filter(!(bird=="rd84gr50" & labels %in% c("d"))) %>% 
+  group_by(bird) %>% 
+  mutate(labels1 = as.numeric(factor(labels))) %>%
+  mutate(rel_date1 = if_else(rel_date<0, "PRE", as.character(rel_date))) %>%
+ # filter(rel_date1 %in% c("PRE", "2", "3", "4", "5")) %>%
+   filter(rel_date1 %in% c("PRE", "2", "3", "4", "5", "6", "7")) %>%
+  group_by(period, bird, labels, log.sirna) %>%
+  summarize(ff_cv_z = mean(ff_cv_z),
+            ff_cv_perc = mean(ff_cv_perc)) %>% 
+  mutate(bird_labels = paste(bird, labels, sep = "-")) 
+
+tmp = tmp %>% mutate(log.sirna = factor(log.sirna, 
+                                        levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                                        labels=c("control", "CRHBP", "CRHBP", "CRH")))
+
+
+gg = ggplot(tmp, aes(period, ff_cv_z, color=bird_labels))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_cv_perc, color=bird_labels))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_cv_perc, color=log.sirna))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_wrap(~bird)
+gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+gg = ggplot(tmp, aes(period, ff_cv_z, color=log.sirna))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_wrap(~bird)
+#gg = gg + ylim(-25, 125)
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+
+gg = ggplot(tmp, aes(period, ff_cv_perc, color=bird))
+gg = gg + geom_point()
+gg = gg + geom_line(aes(group=bird_labels))
+gg = gg + facet_grid(.~log.sirna)
+#gg = gg + ylim(-40, 125)
+
+gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline")
+gg
+save_plot(file.path(out_dir, "ff_cv_period_mean.pdf"), gg, base_height=3, base_aspect_ratio = .8, ncol=3, nrow=1)
+```
+```{r}
+tmp = ffreq2 %>%
+  #filter(!(bird %in% c("bu88bu26"))) %>% 
+  group_by(bird) %>% 
+  mutate(labels1 = as.numeric(factor(labels))) %>%
+  mutate(rel_date1 = if_else(rel_date<0, "PRE", as.character(rel_date))) %>%
+  filter(rel_date1 %in% c("PRE", "2", "3", "4", "5", "6", "7")) %>%
+  mutate(log.sirna2 = factor(log.sirna, 
+                                        levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                                        labels=c("control", "CRHBP", "CRHBP", "CRH"))) %>% 
+  group_by(period, log.sirna2, bird) %>%
+  summarize_at(vars(ff_cv_z, ff_cv_perc), funs(mean, sd, sem))
+
+tmp2 = tmp %>% 
+  ungroup() %>%
+  group_by(period, log.sirna2) %>%
+  summarize_at(vars(ff_cv_z_mean, ff_cv_perc_mean), funs(mean, sd, sem)) #%>%
+  #mutate(bird_labels = paste(bird, labels, sep = "-")) 
+# tmp = tmp %>% mutate(log.sirna = factor(log.sirna, 
+#                                         levels = c("control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+#                                         labels=c("control", "CRHBP", "CRHBP", "CRH")))
+
+gg = ggplot(tmp2, aes(period, ff_cv_perc_mean_mean))
+gg = gg + geom_pointrange(aes(ymin=(ff_cv_perc_mean_mean - ff_cv_perc_mean_sem), ymax=(ff_cv_perc_mean_mean + ff_cv_perc_mean_sem)))
+gg = gg + geom_line(aes(group=log.sirna2))
+gg = gg + facet_grid(.~log.sirna2)
+#gg = gg + ylim(-40, 125)
+#gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline")
+gg
+save_plot(file.path(out_dir, "ff_cv_period_mean_mean.pdf"), gg, base_height=2.5, base_aspect_ratio = .6, ncol=3, nrow=1)
+
+gg = ggplot(tmp2, aes(period, ff_cv_z_mean_mean))
+gg = gg + geom_pointrange(aes(ymin=(ff_cv_z_mean_mean - ff_cv_z_mean_sem), ymax=(ff_cv_z_mean_mean + ff_cv_z_mean_sem)))
+gg = gg + geom_line(aes(group=log.sirna2))
+gg = gg + facet_grid(.~log.sirna2)
+#gg = gg + ylim(-40, 125)
+#gg = gg + scale_y_continuous(limits=c(-30, 125), breaks=c(-25, 0, 25, 50, 75, 100))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + theme(legend.position="none")
+gg = gg + labs(x = "period relative to siRNA injection", y = "FF CV, Z-score to baseline")
+gg
+save_plot(file.path(out_dir, "ff_cv_z_period_mean_mean.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=3, nrow=1)
+```
+
+```{r}
+
+gg = ggplot(tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_cv_perc_mean_mean, color=log.sirna2)) +
+  geom_pointrange(aes(ymin=(ff_cv_perc_mean_mean - ff_cv_perc_mean_sem), ymax=(ff_cv_perc_mean_mean + ff_cv_perc_mean_sem))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_cv_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+gg = ggplot() +
+  geom_point(data = tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_cv_perc_mean_mean, color=log.sirna2)) + 
+  geom_point(data = tmp %>% filter(period=="POST"), aes(log.sirna2, ff_cv_perc_mean), color="grey", position = position_jitter(), size=1) + 
+ # geom_pointrange(aes(ymin=(ff_cv_perc_mean_mean - ff_cv_perc_mean_sem), ymax=(ff_cv_perc_mean_mean + ff_cv_perc_mean_sem))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_cv_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+
+gg = ggplot(tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_cv_perc_mean_mean)) + 
+  geom_bar(stat="identity", aes(fill=log.sirna2), alpha=.5) +
+  geom_errorbar(aes(ymin=(ff_cv_perc_mean_mean - ff_cv_perc_mean_sem), ymax=(ff_cv_perc_mean_mean + ff_cv_perc_mean_sem)), width=0) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline") + 
+  scale_color_manual(values=colors) + 
+  scale_fill_manual(values=colors)
+gg
+save_plot(file.path(out_dir, "ff_cv_perc_period_mean_mean_post_bar.pdf"), gg, base_height=3, base_aspect_ratio = .75, ncol=1, nrow=1)
+```
+
+```{r}
+tmp = ffreq2 %>% filter(bird=="wh20pk99")
+gg =ggplot(tmp, aes(rel_date, ff_mean_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="or46pu99")
+gg =ggplot(tmp, aes(rel_date, ff_mean_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="or46pu99")
+gg =ggplot(tmp, aes(rel_date, ff_cv_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+
+tmp = ffreq2 %>% filter(bird=="pu17bk34")
+gg =ggplot(tmp, aes(rel_date, ff_cv_z))
+gg = gg + geom_point()
+gg = gg + facet_wrap(~labels)
+gg
+```
+
+
+```{r}
+plot_grouped_across_time2 = function(dat, value, values_form) {
+  print(value)
+  values_form_cur = values_form %>% filter(val == value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", value, color="bird")) 
+  gg = gg + geom_point(position = position_jitter(width=.2))
+  gg = gg + facet_grid(log.sirna~.)
+  #gg = gg + ylim(values_form_cur$ymin[1], values_form_cur$ymax[1])
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+ffreq2_filt= ffreq2 %>% 
+  filter(!(bird=="wh20pk99" & labels=="b")) %>%
+  filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>%
+  filter(!(bird=="rd84gr50" & labels %in% c("d")))
+plot_grouped_across_time2(ffreq2_filt, "ff_mean_z", values_form)
+```
+
+```{r}
+walk(values, function(value) {
+  plot_grouped_across_time2(ffreq2_filt, value, values_form)
+})
+```
+
+```{r}
+#vars_cur_z_mean = paste(vars_cur_z, "_mean", sep="")
+#up = function(x,y) {x+y}
+#low = function(x,y) {x-y}
+ffreq1 = ffreq2 %>%
+  # filter(!(bird=="wh20pk99" & labels=="b")) %>%
+  # filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) %>% 
+   filter(!(bird %in% c("pu17bk34"))) %>% 
+ # filter(!(bird %in% c("or95bk93"))) %>% 
+   filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23"))) %>% # extensive gliosis by
+  group_by(rel_date, bird, log.sirna) %>% summarize_at(vars(values), list(mean="mean_na", sem="sem_na", sd="sd_na")) 
+```
+
+```{r}
+plot_grouped3_across_time = function(dat, value, values_form) {
+  print(value)
+    values_form_cur = values_form %>% filter(val == value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+  
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+   gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+   gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s_line.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  #return(gg)
+  print(gg)
+}
+
+value = "ff_mean_z"
+plot_grouped3_across_time(ffreq1, value, values_form)
+
+```
+
+```{r}
+walk(values, ~plot_grouped3_across_time(ffreq1, .x, values_form))
+```
+```{r}
+plot_grouped3_across_time_lims = function(dat, value, values_form) {
+  print(value)
+    values_form_cur = values_form %>% filter(val == value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+  
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+   gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  
+  if (grepl("z", value)) {
+  gg = gg + lims(y=c(-10, 10))
+  } else if (grepl("perc", value)) {
+    gg = gg + lims(y=c(-50, 50)) 
+  }
+  value_trim = sub("_mean$", "", value)
+   gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  save_plot(file.path(out_dir, sprintf("%s_line_lims.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  #return(gg)
+  print(gg)
+}
+walk(values, ~plot_grouped3_across_time_lims(ffreq1, .x, values_form))
+
+```
+
+#### Hypothesis testing
+```{r}
+group_modeling_dir = file.path(out_dir, "models")
+dir.create(group_modeling_dir)
+```
+
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+
+#### Grouped 
+```{r message=FALSE, warning=FALSE}
+redo = F
+
+#min_date = -2
+#max_date = 8
+fname = file.path(group_modeling_dir, "relative_to_baseline_ff_cv_grouped.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+
+    tmp = dat %>% 
+      rename(value = !!as.symbol(value))
+    
+    tmp %>% 
+      group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = ffreq2 %>% group_by(bird, rel_date, log.sirna, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  
+  post_rel_dates = 2:7
+  
+  cur = ffreq2 %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna = factor(log.sirna)) %>%
+    # inner_join(nsyls) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH")) %>%
+    filter(rel_date %in% post_rel_dates | period=="PRE") %>%
+    mutate(period = factor(period, levels=c("PRE", "POST"))) #%>% 
+ #   filter(!(bird %in% c("bu88bu26"))) 
+    #filter(!(bird %in% c("pu17bk34", "or95bk93"))) %>%
+    #filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23")))# %>% # extensive gliosis by
+    #filter(bird != "rd23gr10")
+    #filter(bird != "or83or25")
+    #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+    #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) #%>%
+    #filter(!(bird=="bu88bu26" & labels %in% c("d", "w", "e")))# %>% 
+  
+  
+  des = value ~ period + (1  | bird / labels)
+
+  values1 = c("ff_mean_z", "ff_mean_perc", "ff_cv_z", "ff_cv_perc", "ff_cv")
+  
+  mods = map(values1, function(x) {
+    cur1 = cur# %>% 
+      #group_by(bird, period, log.sirna, labels) %>%
+      #sample_n(200) %>%
+      #ungroup()
+    run_lmer_model(cur1, des, x)
+    
+  }) %>% 
+    set_names(values1) %>%
+    bind_rows(.id="variable")
+  
+
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="period") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() #%>%
+  #mutate(rel_date = as.numeric(rel_date))
+mods_p
+```
+
+```{r}
+mods %>% filter(level=="fixed", coef=="periodPOST")
+```
+
+```{r}
+tmp = mods %>% filter(level=="fixed", coef=="periodPOST") %>%
+  pivot_wider(names_from = coef_type, values_from = "value") %>%
+  mutate(log.sirna2 = factor(log.sirna2, 
+                             levels = c("control", "CRHBP", "CRH")))
+
+colnames(tmp) = make.names(colnames(tmp))
+
+vars_to_plot = c("ff_mean_perc", "ff_cv_perc")
+walk(vars_to_plot, function(vtp) {
+tmp2 = tmp %>% 
+    filter(variable==vtp) 
+
+gg = ggplot(tmp2, aes(log.sirna2, Estimate, color=log.sirna2)) +
+  geom_pointrange(aes(ymin=(Estimate - Std..Error), ymax=(Estimate + Std..Error))) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+  scale_color_manual(values=colors)
+gg
+save_plot(file.path(out_dir, sprintf("%s_period_mean_mean_post_point_model.pdf", vtp)), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+
+# gg = ggplot(tmp2) +
+#   geom_point(data = tmp2 %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean_mean, color=log.sirna2)) + 
+#   geom_point(data = tmp %>% filter(period=="POST"), aes(log.sirna2, ff_mean_perc_mean), color="grey", position = position_jitter(), size=1) + 
+#  # geom_pointrange(aes(ymin=(ff_mean_perc_mean_mean - ff_mean_perc_mean_sem), ymax=(ff_mean_perc_mean_mean + ff_mean_perc_mean_sem))) +
+#   geom_hline(yintercept=0, linetype=2) +
+#   theme(legend.position="none") +
+#   labs(x = "period relative to siRNA injection", y =  "FF CV, % of baseline") + 
+#   scale_color_manual(values=colors)
+# gg
+# save_plot(file.path(out_dir, "ff_mean_perc_period_mean_mean_post_point.pdf"), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+
+## Current Fig 7F
+gg = ggplot(tmp2, aes(log.sirna2, Estimate)) + 
+  geom_bar(stat="identity", aes(fill=log.sirna2), alpha=.5) +
+  geom_errorbar(aes(ymin=(Estimate - Std..Error), ymax=(Estimate + Std..Error)), width=0) +
+  geom_hline(yintercept=0, linetype=2) +
+  theme(legend.position="none") +
+  labs(x = "period relative to siRNA injection", y = "FF CV, % of baseline") + 
+  scale_color_manual(values=colors) + 
+  scale_fill_manual(values=colors)
+gg
+save_plot(file.path(out_dir, sprintf("%s_period_mean_mean_post_bar_model.pdf", vtp)), gg, base_height=3, base_aspect_ratio = .5, ncol=1, nrow=1)
+})
+```
+
+#### Grouped  - relative to control
+```{r message=FALSE, warning=FALSE}
+redo = F
+
+#min_date = -2
+#max_date = 8
+fname = file.path(group_modeling_dir, "relative_to_baseline_ff_grouped.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+
+    tmp = dat %>% 
+      rename(value = !!as.symbol(value))
+    
+    tmp %>% 
+     # group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = ffreq2 %>% group_by(bird, rel_date, log.sirna, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  
+  post_rel_dates = 2:6
+  
+  cur = ffreq2 %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna = factor(log.sirna)) %>%
+    # inner_join(nsyls) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH")) %>%
+    filter(rel_date %in% post_rel_dates | period=="PRE") %>%
+    mutate(period = factor(period, levels=c("PRE", "POST"))) #%>% 
+ #   filter(!(bird %in% c("bu88bu26"))) 
+    #filter(!(bird %in% c("pu17bk34", "or95bk93"))) %>%
+    #filter(!(bird %in% c("rd34wh99", "or56or29", "pk61gr23")))# %>% # extensive gliosis by
+    #filter(bird != "rd23gr10")
+    #filter(bird != "or83or25")
+    #filter(!(bird=="wh20pk99" & labels=="b")) %>%
+    #filter(!(bird=="or46pu99" & labels %in% c("e", "x", "r"))) #%>%
+    #filter(!(bird=="bu88bu26" & labels %in% c("d", "w", "e")))# %>% 
+  
+  
+  des = value ~ log.sirna2 + (1  | bird / labels)
+
+  values1 = c("ff_mean_z", "ff_mean_perc", "ff_cv_z", "ff_cv_perc", "ff_cv")
+  
+  to_test = c("CRHBP", "CRH")
+  mods = map(values1, function(x) {
+    map(to_test, function(group_to_test) {
+      print(group_to_test)
+    cur1 = cur %>%
+      filter(log.sirna2 %in% c("control", group_to_test))
+      #group_by(bird, period, log.sirna, labels) %>%
+      #sample_n(200) %>%
+      #ungroup()
+    run_lmer_model(cur1, des, x)
+    }) %>% set_names(to_test) %>% bind_rows(.id="log.sirna2")
+  }) %>% 
+    set_names(values1) %>%
+    bind_rows(.id="variable")
+  
+
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="log.sirna2") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() #%>%
+  #mutate(rel_date = as.numeric(rel_date))
+mods_p
+```
+
+```{r}
+mods %>% filter(level=="fixed", coef=="log.sirna2CRH", coef_type=="Estimate")
+```
+

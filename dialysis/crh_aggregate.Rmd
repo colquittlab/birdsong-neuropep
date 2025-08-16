@@ -1,0 +1,903 @@
+---
+output: html_notebook
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(R.matlab)
+library(stringr)
+library(parallel)
+library(doParallel)
+library(lubridate)
+library(Cairo)
+source("~/src/songanalysis/song_util.R")
+source("~/src/songanalysis/song_db.R")
+source("~/src/songanalysis/song_ff.R")
+source("~/src/songanalysis/deafen_plot.R")
+source("~/src/songanalysis/song_plot.R")
+source("~/data2/rstudio/birds/utils/dialysis.R")
+library(tidyverse)
+library(cowplot)
+```
+
+```{r}
+registerDoParallel(cores=7)
+```
+
+```{r}
+filter = dplyr::filter
+summarize = dplyr::summarize
+mutate = dplyr::mutate
+```
+
+# Load info 
+```{r}
+prefix_song = "/mnt/bengal_home/song"
+prefix_data = "~/data2/rstudio/birds/deafen/song_analysis/dialysis"
+```
+
+```{r}
+birds = c("or71or43", "bu90bu20", "wh27pk57")
+```
+
+```{r}
+data_dir = paste("~/data2/rstudio/birds/deafen/song_analysis/dialysis/", sep="/")
+dir.create(data_dir, recursive=T) 
+plot_dir = paste(data_dir, "crh_aggregate", "figures", sep="/")
+dir.create(plot_dir, recursive=T)
+```
+
+# Set up data dbs
+```{r}
+dbs = map(birds, ~src_sqlite(paste(data_dir, .x, sprintf("%s.db", .x), sep="/"), create=T))
+names(dbs) = birds
+```
+
+```{r}
+infos = map(dbs, ~collect(tbl(.x, "info"), n=Inf))
+names(infos) = birds
+info = bind_rows(infos)
+
+info = info %>% mutate(expt2 = gsub(" \\([1-9]\\)", "", expt),
+                       expt2 = gsub("-[1-9]", "", expt2) )
+```
+
+```{r}
+tname_spec = "spec"
+tname_amp = "amps"
+syls = map(dbs, ~collect(tbl(.x, tname_spec), n=Inf)) %>% bind_rows(.id="bird")
+amps = map(dbs, ~collect(tbl(.x, tname_amp), n=Inf)) %>% bind_rows(.id="bird")
+syls = left_join(syls, amps)
+syls = syls %>% distinct(id, .keep_all=T)
+```
+
+```{r}
+syls1 = syls %>% left_join(info %>% select(-bird), by="mat")
+syls1 = syls1 %>% filter(!is.na(expt))
+syls1 = syls1 %>% filter(!(labels %in% c(" ", "-", "t")))
+```
+
+```{r}
+syls1 = syls1 %>% mutate(went_mean_log2 = log2(went_mean),
+                         went_var_log2 = log2(went_var),
+                         amp_mean_log2 = log2(amp_mean),
+                         went_mean_norm_amp_mean_log2 = went_mean_log2 + amp_mean_log2)
+```
+
+```{r}
+lms = syls1 %>% group_by(bird, labels) %>% do({
+  d = .
+  d = d[! (is.na(d$went_mean_log2) | is.na(d$amp_mean_log2)),]
+  mod = lm(went_mean_log2 ~ amp_mean_log2, data=d)
+  data.frame(went_mean_log2_res=residuals(mod), went_mean_log2=d$went_mean_log2, mat=d$mat)
+})
+syls1 = syls1 %>% left_join(lms)
+```
+
+```{r}
+tmp = syls1 %>% group_by(bird, labels) %>% sample_frac(.2)
+gg = ggplot(tmp, aes(amp_mean_log2, went_mean_log2)) + geom_point(alpha=.1) + facet_grid(bird~labels)
+gg = gg + stat_smooth(method="lm", se=F)
+gg
+
+gg = ggplot(tmp, aes(amp_mean_log2, went_mean_log2_res)) + geom_point(alpha=.1) + facet_grid(bird~labels)
+gg = gg + stat_smooth(method="lm", se=F)
+gg
+
+```
+
+```{r}
+syls1 = syls1 %>% group_by(bird, expt, labels) %>% 
+  mutate(freq_mean_z = zscore_my(freq_mean, freq_mean[period=="PRE"]),
+         freq_mean_cv_z = zscore_my(freq_mean_cv, freq_mean_cv[period=="PRE"]),
+         went_mean_log2_z = zscore_my(went_mean_log2, went_mean_log2[period=="PRE"]),
+         went_var_log2_z = zscore_my(went_var_log2, went_var_log2[period=="PRE"]),
+         goodness_z = zscore_my(goodness, goodness[period=="PRE"]),
+         amp_mean_log2_z = zscore_my(amp_mean_log2, amp_mean_log2[period=="PRE"]),
+         went_mean_norm_amp_mean_log2_z = zscore_my(went_mean_norm_amp_mean_log2, 
+                                                 went_mean_norm_amp_mean_log2[period=="PRE"]),
+         went_mean_log2_res_z = zscore_my(went_mean_log2_res, 
+                                       went_mean_log2_res[period=="PRE"]))
+```
+
+```{r}
+norm_expt = "PBS-control (1)"
+syls1 = syls1 %>% group_by(bird, labels) %>% 
+  mutate(freq_mean_z1 = zscore_my(freq_mean, freq_mean[expt==norm_expt]),
+         freq_mean_cv_z1 = zscore_my(freq_mean_cv, freq_mean_cv[expt==norm_expt]),
+         went_mean_log2_z1 = zscore_my(went_mean_log2, went_mean_log2[expt==norm_expt]),
+         went_var_log2_z1 = zscore_my(went_var_log2, went_var_log2[expt==norm_expt]),
+         goodness_z1 = zscore_my(goodness, goodness[expt==norm_expt]),
+         amp_mean_log2_z1 = zscore_my(amp_mean_log2, amp_mean_log2[expt==norm_expt]),
+         went_mean_norm_amp_mean_log2_z1 = zscore_my(went_mean_norm_amp_mean_log2, 
+                                                 went_mean_norm_amp_mean_log2[expt==norm_expt]),
+         went_mean_log2_res_z1 = zscore_my(went_mean_log2_res, 
+                                       went_mean_log2_res[expt==norm_expt]))
+```
+
+```{r}
+syls1 = syls1 %>% group_by(bird, expt, labels) %>% 
+  mutate_at(.vars=c("went_mean_log2", "went_mean_log2_res", "went_var_log2", "freq_mean",  "amp_mean_log2", "goodness",
+                    "went_mean_log2_z", "went_mean_log2_res_z", "went_var_log2_z", "freq_mean_z", "amp_mean_log2_z", "goodness_z" ),
+            .funs=funs(rolling_mean = calc_rolling_func(., window=15, func=mean, direction="backward"),
+                    rolling_cv = calc_rolling_func(., window=15, func=calc_cv, direction="backward"),
+                    rolling_sd = calc_rolling_func(., window=15, func=sd, direction="backward")))
+
+syls1 = syls1 %>% group_by(bird, expt, labels) %>% arrange(parsed_time, onsets) %>% mutate(rendition = 1:n())
+
+syls1 = syls1 %>% 
+  group_by(bird, expt) %>% 
+  mutate(rendition_drug_start_dist = abs(drug_start - parsed_time),
+         rendition_drug_stop_dist = abs(drug_stop - parsed_time))
+syls1_un1 = syls1 %>%
+  filter(!is.na(drug_start)) %>%
+  group_by(bird, expt, drug_start, labels) %>% 
+  summarize(rendition_drug_start = rendition[rendition_drug_start_dist==min(rendition_drug_start_dist)][1],
+            rendition_drug_stop = rendition[rendition_drug_stop_dist==min(rendition_drug_stop_dist)][1])
+syls1 = syls1 %>% left_join(syls1_un1)
+```
+
+```{r}
+values = c("went_mean_log2_z", "went_mean_log2_res_z", "goodness_z", "went_var_log2_z", "amp_mean_log2_z", "freq_mean_z", "freq_mean_cv_z", "went_mean_log2_rolling_mean", "went_mean_log2_rolling_cv", "went_mean_log2_z_rolling_mean", "went_mean_log2_res_z_rolling_mean", "went_mean_log2_res_z_rolling_cv", "freq_mean_z_rolling_cv")
+
+to_analyze = data.frame(labels=c("c", "d", "f",
+                        "c", "d", "f", 
+                        "e", "f", "r"), 
+               bird=c(rep("or71or43", times=3),
+                      rep("wh27pk57", times=3),
+                      rep("bu90bu20", times=3)))
+```
+
+```{r}
+syls2 = syls1 %>% 
+  inner_join(to_analyze) %>% 
+  filter(period!="EXCLUDE") %>% 
+  group_by(bird, expt, period) %>% 
+  summarize_at(.vars = values, .funs = c("mean", "sd"), na.rm=T) %>%
+  left_join(info)
+```
+```{r}
+syls2 = syls1 %>% 
+  inner_join(to_analyze) %>% 
+  filter(period!="EXCLUDE") %>% 
+  group_by(bird, expt, period, labels) %>% 
+  summarize_at(.vars = values, .funs = c("mean", "sd"), na.rm=T) #%>%
+  #left_join(info)
+expt_levels = c(
+  "PBS-control (1)",
+  "PBS-control (2)",
+  "PBS-control (3)",
+  "PBS-control (4)",
+  "PBS-control (5)",
+  "PBS-test (1)",
+  "PBS-test (2)",
+  "10 uM CRF",
+  "10 uM CRF (2)",
+  "20 uM CRF"
+  ,"20 uM CRF (2)"
+  ,"100 uM CRF (1)"
+  ,"100 uM CRF (2)"
+  ,"100 uM CRF (3)"
+  ,"10 uM CRF(6-33)"
+  ,"10 uM CRF/10 uM CRF(6-33)"
+)
+syls3 = syls2 %>%
+  ungroup() %>% 
+  mutate(expt = factor(expt, levels=expt_levels),
+         period = factor(period, levels=c("PRE", "DRUG", "POST")),
+         bird_labels = paste(bird, labels, sep="_")) %>%
+  filter(!is.na(expt))
+```
+
+```{r}
+values1 = paste(values, "mean", sep="_")
+tmp = syls3 %>% 
+  filter(!(bird_labels %in% c("or71or43_r", "bu90bu20_r", "or71or43_v", "wh27pk57_d")))
+for (value in values1) {
+  print(value)
+  #value = "amp_mean_log2_z_mean"
+  gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(aes(color=bird_labels), position=position_jitter(width=.1))
+  gg = gg + facet_wrap(~expt)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_expt_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+  
+   gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(aes(color=bird), position=position_jitter(width=.1))
+  gg = gg + facet_wrap(~expt2)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_expt_grouped_split_by_bird.pdf", value), sep="/"), width=8, height=8)
+  
+  gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(position=position_jitter(width=.1), alpha=.2)
+  gg = gg + stat_summary(fun.data = "mean_se", size=.4)
+  gg = gg + facet_wrap(~expt2)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_expt_grouped.pdf", value), sep="/"), width=8, height=8)
+}
+```
+
+```{r}
+syls2 = syls1 %>% 
+  inner_join(to_analyze) %>% 
+  filter(period!="EXCLUDE") %>% 
+#  filter(!(expt %in% c("PBS-control (5)", "PBS-control (1)"))) %>%
+  group_by(bird, expt2, period, labels) %>% 
+  summarize_at(.vars = values, .funs = c("mean", "sd"), na.rm=T) #%>%
+  #left_join(info)
+expt2_levels = c(
+  "PBS-control",
+  "PBS-test",
+  "1 uM CRF"
+  ,"2 uM CRF"
+  ,"5 uM CRF",
+  "10 uM CRF",
+  "20 uM CRF"
+  ,"100 uM CRF"
+  ,"10 uM CRF(6-33)"
+  ,"10 uM CRF/10 uM CRF(6-33)"
+)
+syls3 = syls2 %>%
+  ungroup() %>% 
+  mutate(expt2 = factor(expt2, levels=expt2_levels),
+         period = factor(period, levels=c("PRE", "DRUG", "POST")),
+         bird_labels = paste(bird, labels, sep="_")) %>%
+  filter(!is.na(expt2))
+```
+
+```{r}
+values1 = paste(values, "mean", sep="_")
+tmp = syls3 %>% 
+  filter(!(bird_labels %in% c("or71or43_r", "bu90bu20_r", "or71or43_v", "wh27pk57_d")))
+for (value in values1) {
+  print(value)
+  #value = "amp_mean_log2_z_mean"
+  gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(aes(color=bird_labels), position=position_jitter(width=.1))
+  gg = gg + facet_wrap(~expt2)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+  
+   gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(aes(color=bird), position=position_jitter(width=.1))
+  gg = gg + facet_wrap(~expt2)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_bird.pdf", value), sep="/"), width=8, height=8)
+  
+  gg = ggplot(tmp, aes_string("period", value))
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + geom_point(position=position_jitter(width=.1), alpha=.2)
+  gg = gg + stat_summary(fun.data = "mean_se", size=.4)
+  gg = gg + facet_wrap(~expt2)
+  gg = gg + labs(x="", y="Z-score mean", title=value)
+  #gg = gg + ylim(0,100)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_grouped.pdf", value), sep="/"), width=8, height=8)
+}
+```
+
+Nothing strongly different. Could perhaps make a case for the reduction of amplitude; somewhat proportional to CRF concentration
+
+### Calc FF
+#### Average spectrogram
+```{r}
+labels = c("c",  "d", "f")
+for (l in labels) {
+  psd = calc_average_spectrogram(info[sample(1:nrow(info), 20),], label=l)
+  gg = plot_average_spectrogram(psd)
+  gg = gg + labs(title=l)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("average_spec_%s.pdf", l), sep="/"), height=5, width=6)
+}
+```
+
+#### Pitch contours
+```{r}
+params1 = data.frame(bird="wh27pk57",
+                    labels = c("c", "d", "f"),
+                    lbuffer=c(.015, .015, .04),
+                    freq_lower = c(3, 2.8, 1.5),
+                    freq_upper = c(3.6, 3.5, 2),
+                    stringsAsFactors = F)
+params2 = data.frame(bird="bu90bu20",
+                    labels = c("e", "f", "g", "r"),
+                    lbuffer=c(.00, .015, .015, .04),
+                    freq_lower = c(3.5, 3.2, 4, 2),
+                    freq_upper = c(3.8, 3.6, 4.5, 2.6),
+                    stringsAsFactors = F)
+params3 = data.frame(bird="or71or43",
+                    labels = c("c", "d", "f"),
+                    lbuffer=c(.015, .015, .04),
+                    freq_lower = c(3, 2.8, 1.5),
+                    freq_upper = c(3.6, 3.5, 2),
+                    stringsAsFactors = F)
+params = rbind(params1, params2, params3)
+```
+
+```{r}
+# mats1 = mats %>% left_join(info, by="mat") %>% left_join(params, by="labels")
+```
+
+```{r}
+# calc_pitch_tmp = function(d, nsyls, audio_input, label, lbuffer, total_time, step_size, wl, parallel) {
+#   if (nrow(d) < 10)
+#     return(data.frame())
+#   calc_pitch_contour_batch2(mats=d,
+#                             nsyls = nsyls,
+#                             audio_input=audio_input, label=unique(d$labels),
+#                             lbuffer=lbuffer,
+#                             total_time=total_time,
+#                             step_size=step_size,
+#                             wl=wl,
+#                             parallel=parallel)
+# }
+```
+
+```{r, warning=FALSE}
+# audio_input="wav"
+# lbuffer = -.01
+# total_time = .060
+# step_size = .001
+# wl = 512
+# nsyls = 50
+# labels1 = c("c", "d", "f")
+# dates = as.character(unique(info$date))
+# 
+# 
+# redo = T
+# pc_fname = paste(data_dir, "pitch_contours.rds", sep="/")
+# if (redo) {
+# 
+# mats2 = mats1 %>% filter(expt=="100 uM CRF (1)")
+# pcs = mats2 %>% filter(labels %in% labels1, !is.na(expt), period!="EXCLUDE") %>%  group_by(labels, expt) %>% do({
+#   print(unique(.$labels))
+#   print(unique(.$expt))
+#   calc_pitch_tmp(., nsyls=nsyls, audio_input, unique(.$labels), lbuffer = lbuffer,
+#                  total_time, step_size, wl=wl, parallel=F)
+# 
+# })
+#  saveRDS(pcs, pc_fname)
+# } else {
+#   pcs = readRDS(pc_fname)
+# }
+```
+
+```{r}
+# for (l in labels1) {
+#   tmp = pcs %>% filter(labels==l) %>% 
+#     filter(ff > freq_lower, ff < freq_upper) %>% 
+#     #filter(rel_times > .01, rel_times< .04) %>% 
+#     mutate(on_drug = (log.drug!="PBS"))
+#   gg = plot_pitch_contour(tmp, evtaf=F)
+#   gg = gg + geom_line(aes(color=log.drug), alpha=.1)
+#   gg = gg + facet_grid(expt~on_drug, scales="free_y")
+#   gg = gg + theme(strip.text.y=element_text(angle=0))
+#   #gg = gg + stat_summary(fun.y=mean, geom="line", color=1)
+#   print(gg)
+#   ggsave(paste(plot_dir, sprintf("pitch_contours_by_expt_%s.pdf", l), sep="/"), height=10, width=8)
+# }
+```
+
+
+##### DTW pitch contours
+```{r}
+# pcs = pcs %>% group_by(id) %>% 
+#   mutate(ff_norm = ff - mean(ff)) %>%
+#   ungroup()
+# pcs_dtw = pcs %>% group_by(labels) %>% do({
+#   d = .
+#   print(unique(d$labels))
+#   dtw_contour_full(d, stepPattern=asymmetric, smooth=T, parallel=T)
+# }) %>% left_join(pcs, by=c("id", "rel_times", "labels"))
+```
+
+```{r}
+# for (l in labels1) {
+#   tmp = pcs_dtw %>% filter(labels==l) %>% select(-ff) %>% 
+#     rename(ff = ff_dtw) %>% 
+#     filter(ff > freq_lower, ff < freq_upper) %>% 
+#     #filter(rel_times > .01, rel_times< .04) %>% 
+#     mutate(on_drug = (log.drug!="PBS"))
+#   gg = plot_pitch_contour(tmp, evtaf=F)
+#   gg = gg + geom_line(aes(color=log.drug), alpha=.1)
+#   gg = gg + facet_grid(expt~on_drug, scales="free_y")
+#   gg = gg + theme(strip.text.y=element_text(angle=0))
+#   print(gg)
+#   ggsave(paste(plot_dir, sprintf("pitch_contours_by_expt_dtw_%s.pdf", l), sep="/"), height=10, width=6)
+# }
+```
+
+Pitch contour variance
+```{r}
+# pcs_dtw = pcs_dtw %>%
+#     mutate(on_drug = (log.drug!="PBS"))
+# pcs_dtw1 = pcs_dtw %>% filter(rel_times>.01, rel_times<.04) %>% group_by(id) %>% summarize(ff_dtw_cv = sd(ff_dtw)/mean(ff_dtw)) %>% left_join(pcs_dtw %>% distinct(id, .keep_all=T), by="id")
+# 
+# pcs_dtw2 = pcs_dtw1 %>% group_by(labels, expt, on_drug) %>% summarize(ff_dtw_cv_mean = mean(ff_dtw_cv),
+#                                                            ff_dtw_cv_sd = sd(ff_dtw_cv)) 
+# 
+# gg = ggplot(pcs_dtw1, aes(expt, ff_dtw_cv, color=on_drug))
+# gg = gg + geom_point(position=position_jitterdodge(jitter.width=.2, dodge.width = .4), alpha=.2)
+# gg = gg + facet_wrap(~labels)
+# gg = gg + ylim(0, .05)
+# gg = gg + coord_flip()
+# gg
+```
+
+#### Calc FF
+```{r}
+drop = F
+redo = F
+tname = "ff3"
+if (!db_has_table(db$con, tname) || redo) {
+  
+  if (drop && db_has_table(db$con, tname))
+    db_drop_table(db$con, tname)
+  
+  ffreq = map(1:nrow(params), function(i) {
+    calc_ff2_batch2(info, 
+                    min_freq = params[i, 'freq_lower'], 
+                    max_freq = params[i,'freq_upper'],
+                    label=params[i,'labels'], 
+                    lbuffer=params[i,'lbuffer'], 
+                    audio_input = "wav", 
+                    method = "ff3",
+                    data_db=db,
+                    tname="ff3",
+                    replace_data=F,
+                    parallel=F)
+  }) %>% bind_rows()
+} else {
+  ffreq = collect(tbl(db, tname))
+}
+ffreq = ffreq %>% distinct(id, .keep_all=T)
+``` 
+
+```{r}
+tname="ff3"
+ffreqs = map(dbs, ~collect(tbl(.x, tname), n=Inf))
+ffreq = bind_rows(ffreqs)
+```
+
+
+```{r}
+ffreq1 = ffreq %>% left_join(info %>% select(-wav, -mat_base), by=c("mat"))
+# ffreq1 = ffreq1 %>% group_by(mat) %>% filter(n()>3) %>% do({
+#   mat = .
+#   mat = mat %>% 
+#     mutate(labels=as.character(labels),
+#            id1 = as.numeric(map_chr(str_split(id, "-"), 2))) %>% 
+#     arrange(id1)
+#   matpre = vector("character", length = nrow(mat))
+#   matpost = vector("character", length = nrow(mat))
+#   
+#   matpre[1] = "start"
+#   for (i in 2:nrow(mat)) {
+#     matpre[i] = mat$labels[i-1]
+#     }
+#     for (i in 1:(nrow(mat)-1)) {
+#       matpost[i] = mat$labels[i+1]
+#     }
+#     matpost[length(matpost)] = "end"
+#     
+#     data.frame(mat, matpre, matpost)
+#   }) %>% ungroup()
+# ffreq1 = ffreq1 %>% mutate(labels_con = paste(matpre, toupper(labels), sep=" "),
+#                            labels_div = paste(toupper(labels), matpost, sep=" "))
+```
+
+```{r}
+ffreq1 %>% 
+  group_by(labels, expt) %>%
+  summarize(mean=mean(ff, na.rm=T), 
+            num_na = sum(is.na(ff)),
+            num_not_na = sum(!is.na(ff)))
+```
+
+```{r}
+# ffreq2 = ffreq1 %>%
+#   group_by(labels) %>% 
+#   summarize(mean_ff = mean(ff, na.rm=T), sd_thresh = 2 * sd(ff, na.rm=T)) %>% 
+#   mutate(freq_low = mean_ff - sd_thresh,
+#          freq_high = mean_ff + sd_thresh)
+# 
+
+# ffreq1 = ffreq1 %>% 
+#   left_join(ffreq2)
+# 
+# 
+#  ffreq1 = ffreq1 %>% 
+#    left_join(params)
+# 
+# #ffreq3 = ffreq1 %>% 
+# #  mutate(val_dist = ifelse(mean_ff>ff, abs(mean_ff-ff), abs(ff-mean_ff ))) %>% 
+# #  filter(val_dist < sd_thresh)
+# 
+# ffreq3 = ungroup(ffreq1) %>% filter(ff > freq_lower, ff < freq_upper)
+```
+
+```{r}
+ffreq3 = ffreq1 %>%
+  group_by(expt, labels, bird) %>% 
+  mutate(ff_z= zscore_my(ff, ff[period=="PRE"]))
+```
+
+
+
+```{r}
+# fsc = scale_color_manual(values=c("red","black"))
+# fth = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+```{r}
+# gg = ggplot(ffreq3, aes(ff))
+# gg = gg + geom_density()
+# gg = gg + facet_wrap(~labels, scales="free_x")
+# gg
+ffreq3 %>% filter(period=="PRE", grepl("AP5", expt)) %>% group_by(bird, labels, expt) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+```
+
+```{r}
+ffreq2 = ffreq3 %>% 
+  #filter(ff>1, ff<4) %>% 
+  group_by(expt, labels, period, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+
+ffreq2 
+ffreq2_group = ffreq2 %>% group_by(expt, labels, bird) %>% filter(n()>1) %>% do({
+  d = .
+  #print(d)
+  if (nrow(d)==0 || !("PRE" %in% d$period)) {
+    data.frame(d, ff_cv_change=NA, ff_cv_z = NA)
+  } else {
+  data.frame(d, 
+             ff_cv_change = 100 * (d$ff_cv - d$ff_cv[d$period=="PRE"]) / d$ff_cv[d$period=="PRE"],
+             ff_cv_z = zscore_my(d$ff_cv, d$ff_cv[d$period=="PRE"]))
+  }
+})
+ffreq2_group %>% filter(grepl("AP5", expt))
+#ffreq2_group %>% filter(expt=="1 uM AP5")
+```
+
+```{r}
+#for (l in params$labels) {
+tmp = ffreq2_group %>% ungroup() %>% 
+  filter(grepl("AP5", expt)) %>% 
+  filter(!(bird=="wh27pk57" & expt=="4 mM AP5")) %>%
+  filter(period=="DRUG")
+
+  gg = ggplot(tmp, aes(bird, ff_cv_change, fill=labels)) 
+  gg = gg + geom_bar(position=position_dodge(), stat="identity")
+  #gg = gg + facet_wrap(~labels, scales="free_y")
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+  gg = gg + labs(y="FF CV % difference\nfrom pre-AP5")
+  gg = gg + scale_fill_viridis(discrete = T)
+  print(gg)
+ ggsave(paste(plot_dir, "ff_cv_change_drug.pdf", sep="/"), width=5, height=3)
+#}
+```
+
+```{r}
+for (l in params$labels) {
+  gg = ggplot(ffreq2 %>% filter(labels==l), aes(expt, ff_cv, fill=period)) 
+  gg = gg + geom_bar(position=position_dodge(), stat="identity")
+  #gg = gg + facet_wrap(~labels, scales="free_y")
+  gg = gg + theme_classic()
+  gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("ff_cv - %s.pdf", l), sep="/"), width=fig_width, height=fig_height)
+}
+```
+
+```{r}
+expt_levels = c(
+  "PBS-control (1)",
+  "PBS-control (2)",
+  "PBS-control (3)",
+  "PBS-control (4)",
+  "PBS-control (5)",
+  "PBS-test (1)",
+  "PBS-test (2)",
+  "1 uM CRF",
+  "2 uM CRF",
+  "5 uM CRF",
+  "5 uM CRF (2)",
+  "10 uM CRF",
+  "10 uM CRF (2)",
+  "20 uM CRF"
+  ,"20 uM CRF (2)"
+  ,"100 uM CRF (1)"
+  ,"100 uM CRF (2)"
+  ,"100 uM CRF (3)"
+  ,"10 uM CRF(6-33)"
+  ,"10 uM CRF/10 uM CRF(6-33)"
+)
+
+ffreq2 = ffreq3 %>% 
+  group_by(expt, labels, period, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+ffreq2_group = ffreq2 %>% ungroup() %>%  group_by(expt, labels, bird) %>% filter(n()>1) %>% do({
+  d = .
+  if (nrow(d)==0 || !("PRE" %in% d$period)) {
+    data.frame(d, ff_cv_change=NA, ff_cv_z=NA)
+  } else {
+  data.frame(d, 
+             ff_cv_change = 100 * (d$ff_cv - d$ff_cv[d$period=="PRE"]) / d$ff_cv[d$period=="PRE"],
+             ff_cv_z = zscore_my(d$ff_cv, d$ff_cv[d$period=="PRE"]))
+  }
+})
+
+ffreq3_group = ffreq2_group %>%
+  ungroup() %>% 
+  mutate(expt = factor(expt, levels=expt_levels),
+         period = factor(period, levels=c("PRE", "DRUG", "POST")),
+         bird_labels = paste(bird, labels, sep="_")) %>%
+  filter(!is.na(expt))
+```
+
+```{r}
+value = "ff_cv_change"
+tmp = ffreq3_group %>% filter(period=="DRUG") %>% 
+  filter(!(bird_labels %in% c("or71or43_r", "bu90bu20_r", "or71or43_v", "wh27pk57_d")))
+gg = ggplot(tmp, aes_string("bird_labels", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=bird_labels), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~expt)
+gg = gg + labs(x="", y="Z-score mean", title=value)
+#gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+#ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+
+value = "ff_cv_z"
+tmp = ffreq3_group %>% filter(period=="DRUG") %>% 
+  filter(!(bird_labels %in% c("or71or43_r", "bu90bu20_r", "or71or43_v", "wh27pk57_d")))
+gg = ggplot(tmp, aes_string("bird_labels", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=bird_labels), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~expt)
+gg = gg + labs(x="", y="Z-score mean", title=value)
+#gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+```
+
+
+```{r}
+ffreq22 = ffreq3 %>% 
+  group_by(expt2, labels, period, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+ffreq22_group = ffreq22 %>% ungroup() %>%  group_by(expt2, labels, bird) %>% filter(n()>1) %>% do({
+  d = .
+  if (nrow(d)==0 || !("PRE" %in% d$period)) {
+    data.frame(d, ff_cv_change=NA, ff_cv_z=NA)
+  } else {
+  data.frame(d, 
+             ff_cv_change = 100 * (d$ff_cv - d$ff_cv[d$period=="PRE"]) / d$ff_cv[d$period=="PRE"],
+             ff_cv_z = zscore_my(d$ff_cv, d$ff_cv[d$period=="PRE"]))
+  }
+})
+
+expt2_levels = c(
+  "PBS-control",
+  "PBS-test",
+  "1 uM CRF"
+  ,"2 uM CRF"
+  ,"5 uM CRF",
+  "10 uM CRF",
+  "20 uM CRF"
+  ,"100 uM CRF"
+  ,"10 uM CRF(6-33)"
+  ,"10 uM CRF/10 uM CRF(6-33)"
+)
+ffreq32 = ffreq22_group %>%
+  ungroup() %>% 
+  left_join(info) %>%
+  mutate(expt2 = factor(expt2, levels=expt2_levels),
+         period = factor(period, levels=c("PRE", "DRUG", "POST")),
+         bird_labels = paste(bird, labels, sep="_")) %>%
+  filter(!is.na(expt2))
+```
+
+```{r}
+value = "ff_cv_change"
+tmp = ffreq32 %>% filter(period=="DRUG") %>% 
+  filter(!(bird_labels %in% c("bu90bu20_r", "or71or43_v")))
+gg = ggplot(tmp, aes_string("bird_labels", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=bird_labels), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~expt2)
+gg = gg + labs(x="", y="FF CV % difference from pre-drug", title=value)
+#gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+
+tmp = ffreq32 %>% filter(period=="DRUG") %>% 
+  filter(!(bird_labels %in% c("bu90bu20_r", "or71or43_v")))
+gg = ggplot(tmp, aes_string("expt2", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=log.drug), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~bird_labels)
+gg = gg + labs(x="", y="FF CV % difference from pre-drug", title=value)
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+#gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_expt.pdf", value), sep="/"), width=8, height=8)
+
+
+value = "ff_cv_z"
+gg = ggplot(tmp, aes_string("bird_labels", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=bird_labels), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~expt2)
+gg = gg + labs(x="", y="Z-score mean", title=value)
+#gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+
+
+```
+
+```{r}
+value = "ff_cv_z"
+tmp = ffreq32 %>% filter(period=="DRUG") %>% 
+  filter(!(bird_labels %in% c("or71or43_r", "bu90bu20_r", "or71or43_v")))
+gg = ggplot(tmp, aes_string("bird_labels", value))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_bar(aes(fill=bird_labels), stat="identity", position=position_dodge())
+gg = gg + facet_wrap(~expt2)
+gg = gg + labs(x="", y="Z-score mean", title=value)
+#gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg = gg + theme(axis.text.x=element_blank())
+#gg = gg + ylim(0,100)
+print(gg)
+#ggsave(paste(plot_dir, sprintf("%s_grouped_split_by_syllable.pdf", value), sep="/"), width=8, height=8)
+
+```
+
+```{r}
+for (l in params$labels) {
+gg = ggplot(ffreq2_group %>% filter(labels==l), aes(expt, ff_cv_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+#gg = gg + facet_wrap(~labels)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+print(gg)
+ggsave(paste(plot_dir, sprintf("ff_cv_change - %s.pdf",l), sep="/"), width=fig_width, height=fig_height)
+}
+```
+
+```{r}
+ffreq1 = ffreq1 %>% group_by(expt, labels) %>% 
+  mutate_at(.vars=c("ff"),
+            .funs=funs(rolling_mean = calc_rolling_func(., window=15, func=mean, direction="backward"),
+                    rolling_cv = calc_rolling_func(., window=15, func=calc_cv, direction="backward"),
+                    rolling_sd = calc_rolling_func(., window=15, func=sd, direction="backward")))
+
+ffreq1 = ffreq1 %>% 
+  group_by(expt, labels) %>% 
+  arrange(parsed_time, onsets) %>% 
+  mutate(rendition = 1:n())
+
+ffreq1 = ffreq1 %>% group_by(expt) %>% 
+  mutate(rendition_drug_start_dist = abs(drug_start - parsed_time),
+         rendition_drug_stop_dist = abs(drug_stop - parsed_time))
+
+ffreq1_un1 = ffreq1 %>%
+  filter(!is.na(drug_start)) %>%
+  group_by(expt, drug_start, labels) %>% 
+  summarize(rendition_drug_start = rendition[rendition_drug_start_dist==min(rendition_drug_start_dist)][1],
+            rendition_drug_stop = rendition[rendition_drug_stop_dist==min(rendition_drug_stop_dist)][1])
+ffreq1 = ffreq1 %>% left_join(ffreq1_un1)
+```
+
+#### Plotting
+```{r}
+ff_labels = unique(ffreq3$labels)
+```
+
+```{r}
+colors = c("PBS"="black",
+           "CRF"="red",
+           "AP5"="darkorange",
+           "PBS-test"="blue",
+           "none"="black",
+           "CRF(6-33)" = "darkgreen")
+```
+
+##### Across time
+```{r}
+value = c("ff")
+#filts = c("4 mM AP5", "PBS-control (1)")
+walk(ff_labels, function(label) {
+  
+  gg = plot_across_time_current(ffreq3 %>% filter(labels==label), value)
+  gg = gg + ylim(2,5)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+```
+
+```{r}
+value = c("ff_z")
+#filts = c("4 mM AP5", "PBS-control (1)")
+walk(ff_labels, function(label) {
+  
+  gg = plot_across_time_current(ffreq3 %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+```
+
+```{r}
+value = c("ff_cv_z")
+#filts = c("4 mM AP5", "PBS-control (1)")
+walk(ff_labels, function(label) {
+  print(label)
+  gg = plot_across_time_current(ffreq_cv %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + ylim(-5, 5)
+  #gg = gg + ylim(0, .03)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label)
+  print(gg)
+  ggsave(paste(plot_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+```

@@ -1,0 +1,1508 @@
+---
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+```{r}
+library(R.matlab)
+library(stringr)
+library(parallel)
+library(lubridate)
+library(Cairo)
+source("~/nest/lyre_home/src/songanalysis/song_util.R")
+source("~/nest/lyre_home/src/songanalysis/song_db.R")
+source("~/nest/lyre_home/src/songanalysis/song_ff.R")
+source("~/nest/lyre_home/src/songanalysis/deafen_plot.R")
+source("~/nest/lyre_home/src/songanalysis/song_plot.R")
+source("~/nest/rstudio/utils/dialysis.R")
+source("~/nest/rstudio/utils/hvc.R")
+source("~/nest/rstudio/utils/db.R")
+library(tidyverse)
+library(broom)
+library(here)
+library(cowplot)
+library(broom.mixed)
+```
+
+```{r}
+registerDoMC(cores=6)
+```
+
+```{r}
+filter = dplyr::filter
+summarize = dplyr::summarize
+mutate = dplyr::mutate
+select = dplyr::select
+here = here::here
+```
+
+# Load info 
+```{r}
+prefix_song = "/home/brad/nest/song"
+prefix_data = here()
+```
+
+```{r}
+birds = c("or71or43", "bu90bu20", "bu2bu50", "or31bk86")
+#birds = c("bu2bu50")
+```
+
+```{r}
+data_dir = file.path(prefix_data,   "crh_aggregate")
+dir.create(data_dir, recursive=T) 
+plot_dir = paste(data_dir, "figures", sep="/")
+dir.create(plot_dir, recursive=T)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+dates_to_proc = list(c("songs"))
+surgery_log = load_event_gs(birds)
+#dial_log = load_dialysis_gs(birds)
+info = map(birds, ~load_song_info(.x, "songs", subdir="", dial_log=NULL, surgery_log=surgery_log)) %>%
+ bind_rows()
+info = info %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+info = info %>% mutate(wav = str_extract(wav, "[a-z]+[0-9]+[a-z]+[0-9]+/songs/output_.*"),
+                       mat = str_extract(mat, "[a-z]+[0-9]+[a-z]+[0-9]+/songs/output_.*"))
+```
+
+```{r}
+info %>% distinct(bird, date, log.drug)
+```
+
+
+## Format expt groupings
+```{r}
+expt_format = function(info) {
+  if (all(info$date <= info$event.date)) {
+    return("no-cannulae")
+  } 
+  if (all(info$date> info$event.date & info$date < min(info$log.date, na.rm=T))) {
+    return("no-probes")
+  }
+  
+  if (any(info$log.drug != "PBS")) {
+    npbs = which(info$log.drug !="PBS")
+    
+    log_drug = info$log.drug[npbs[1]]
+    if (log_drug != "PBS-test") {
+      
+      log_conc = info$log.concentration[npbs[1]]
+      
+      out = paste(log_conc, log_drug, sep=" ")
+    } else {
+      out = log_drug
+    }
+    return(out)
+  } else if (all(info$log.drug == "PBS")) {
+    return("PBS-control")
+  }
+}
+
+expt_group_format = function(info) {
+  if (info$expt[1] %in% c("no-cannulae", "no-probes", "PBS-test", "PBS-control")) {
+    return(info$expt)
+  } else {
+    ss = unlist(str_split(info$expt[1], " "))
+    ss = ss[length(ss)]
+    return(ss)
+  }
+}
+drug_date = info %>% 
+  group_by(date,bird) %>%
+  do({
+    expt = expt_format(.)
+    d = .
+    d = d %>% distinct(date, bird)
+    d$expt = expt
+    d$expt_group = expt_group_format(d)
+    d
+  }) %>%
+  group_by(bird, expt_group) %>% 
+  mutate(expt = paste0(expt, " (", 1:n(), ")"))
+
+info = info %>% left_join(drug_date)
+
+info = info %>% mutate(expt_group = sub("biotinyl-", "", expt_group))
+```
+```{r}
+info %>% ungroup() %>%  select(bird, expt_group) %>% table()
+```
+
+
+```{r}
+drug_times = info %>% distinct(bird, log.drug, drug_start, log.concentration)
+drug_times = drug_times %>%
+  mutate(log.drug_conc = ifelse(is.na(log.concentration),
+                                log.drug,
+                                paste(log.concentration, log.drug, sep=" "))
+)
+info = info %>% left_join(drug_times)
+```
+
+
+```{r}
+solvent = "PBS"
+baseline_expts = c("no-probes","no-cannulae")
+info = info %>% group_by(bird, expt) %>% do({
+  print(unique(as.character(.$expt)))
+  d = .
+  d1 = d %>% distinct(log.drug, expt) %>% ungroup() %>%
+    mutate(expt = as.character(expt))
+  if ((nrow(d1)==1 && d1$log.drug==solvent)) {
+    d = d %>%
+      mutate(drug_start = as.POSIXct(paste(date, "10:00:00 PST", sep=" ")),
+             drug_stop = as.POSIXct(paste(date, "14:00:00 PST", sep=" ")))
+    d = d %>%
+      # mutate(log.drug = if_else(parsed_time > drug_start & parsed_time < drug_stop,
+      #                           paste(solvent, "control", sep="-"),
+      #                           solvent))
+      mutate(log.drug = solvent)
+  } else if (any(map_lgl(baseline_expts, ~ any(grepl(.x, d1$expt))))) {
+    d = d %>%
+      mutate(drug_start = as.POSIXct(paste(date, "10:00:00 PST", sep=" ")),
+             drug_stop = as.POSIXct(paste(date, "14:00:00 PST", sep=" ")))
+    d = d %>%
+      mutate(log.drug = "none")
+    } else {
+    dt = d %>% filter(drug_start >= date) %>% filter(!(log.drug %in% c(solvent, "none")))
+    dts = min(dt$drug_start)
+    dtstop = max(dt$drug_stop)
+
+    d$drug_start = dts
+    d$drug_stop = dtstop
+  }
+
+  d
+})
+```
+
+```{r}
+period_levels = c("PRE", "DRUG", "POST")
+info = info %>% group_by(expt, bird) %>%
+  mutate(period = case_when(
+    mtime >= (drug_start - hours(2)) & (mtime < drug_start) ~ "PRE",
+    mtime > drug_start & mtime < drug_stop ~ "DRUG",
+    mtime > (drug_stop + hours(3)) ~ "POST",
+    log.drug!=solvent & (mtime < drug_start | mtime > drug_stop) ~ "EXCLUDE",
+    TRUE ~ "EXCLUDE"
+  )) %>% 
+
+  mutate(period = factor(period, levels=period_levels))
+
+info = info %>% group_by(expt, bird) %>% 
+  mutate(rel_mtime = as.numeric(difftime(mtime, drug_start, units="hours")),
+         rel_drug_start = 0,
+         rel_drug_stop = as.numeric(difftime(drug_stop, drug_start, units="hours")),
+         rel_mtime_hour = round(rel_mtime))
+
+hour_breaks = seq(-8, 8, by = .5)
+info = info %>% group_by(expt, bird) %>% 
+         mutate(rel_mtime_halfhour = cut(rel_mtime, breaks = hour_breaks, include.lowest = T, labels=hour_breaks[2:length(hour_breaks)])) %>%
+  mutate(rel_mtime_halfhour = as.numeric(as.character(rel_mtime_halfhour)))
+
+```
+
+```{r}
+info %>% ungroup() %>% select(period, bird) %>% table()
+```
+
+
+```{r}
+info = info %>% mutate(wav_base = basename(wav),
+                        mat_base = basename(mat))
+
+```
+
+
+# Set up data db
+```{r}
+db = src_sqlite(file.path(data_dir, "combined.db"), create=T)
+db_sub_dirs = map_chr(birds, ~file.path(prefix_data, .x, sprintf("%s.db", .x))) %>% set_names(birds)
+```
+
+# Load features
+```{r}
+reload = F
+tname3 = "syls"
+if (reload) {
+  base_dir = "/mnt/bengal_home/song/%s/songs/autolabel"
+  data_dirs = map(unique(info$bird), ~sprintf(base_dir, .x))
+  data_files = map(data_dirs, function(x) {
+    list.files(x, pattern=".db$", full.names = T)
+  })
+
+  features = map(data_files, load_hvc_db)
+  syls = bind_rows(features)
+  
+  redo = T
+  if (redo && db_has_table(db$con, tname3))
+    db_drop_table(db$con, tname3)
+  copy_to(db, syls, tname3, temporary=F)
+} else {
+  syls = collect(tbl(db, tname3), n=Inf)
+}
+syls = syls %>% mutate(wav = str_extract(wav, "[a-z]+[0-9]+[a-z]+[0-9]+/songs/output_.*"))
+syls = syls %>%
+  rename(went_mean = mean_spectral_flatness,
+         amp_mean = mean_amplitude) %>%
+  mutate(wav_base = basename(wav))
+```
+
+```{r}
+syls1 = left_join(syls, info)
+```
+
+# Frequency
+```{r}
+freq_dir = file.path(plot_dir, "ff")
+dir.create(freq_dir)
+```
+
+```{r}
+wl = 1024
+tname = sprintf("ff3_%s", wl)
+tnames = c("ff3_1024", "ff3_1024", "ff3_1024", "ff3_1024_param4")
+ffreq = map(1:length(db_sub_dirs), function(i) {
+  x = db_sub_dirs[i]
+  tname = tnames[i]
+  print(x)
+  db_sub = src_sqlite(x)
+  collect(tbl(db_sub, tname), n=Inf)
+}) %>% set_names(names(db_sub_dirs)) %>% bind_rows(.id="bird")
+
+ffreq = ffreq %>% distinct(id, bird, .keep_all=T)
+
+## Remove double backslashes
+ffreq = ffreq %>% mutate(wav = gsub("\\/\\/", "\\/", wav)) 
+
+ffreq = ffreq %>% mutate(wav = str_extract(wav, "[a-z]+[0-9]+[a-z]+[0-9]+/songs/output_.*"))
+ffreq = ffreq %>% mutate(mat = str_extract(mat, "[a-z]+[0-9]+[a-z]+[0-9]+/songs/output_.*"))
+ffreq = ffreq %>% filter(wav %in% info$wav)
+``` 
+
+```{r}
+ffreq1 = ffreq %>% left_join(info)
+ffreq1 = ffreq1 %>% left_join(syls1 %>% dplyr::select(mat, onsets, labels, pred_ent))
+ffreq1 = ffreq1 %>% mutate(mtime_onsets = mtime + seconds(onsets))
+ffreq1 = ffreq1 %>% filter(pred_ent<.5)
+```
+
+## Summaries
+```{r}
+
+# recording error, bu2bu50
+exclude_time = c("2018-03-09 18:00:00", "2018-03-10 10:00:00")
+exclude_time = as.POSIXct(exclude_time, tz="")
+
+ffreq2_stats = ffreq1 %>%
+  group_by(bird, labels, expt) %>% 
+  summarize(mean_ff = mean(ff, na.rm=T), sd_thresh = 5 * sd(ff, na.rm=T)) %>% 
+  mutate(freq_low = mean_ff - sd_thresh,
+         freq_high = mean_ff + sd_thresh)
+
+ffreq1 = ffreq1 %>% 
+  left_join(ffreq2_stats)
+
+
+ #ffreq1 = ffreq1 %>% 
+#   left_join(params)
+
+ffreq1 = ffreq1 %>%
+    filter(mtime < exclude_time[1] | mtime > exclude_time[2])
+
+ffreq3 = ungroup(ffreq1) %>% filter(ff > freq_low, ff < freq_high)
+
+ffreq3 = ffreq3 %>%
+  group_by(expt, labels, bird) %>% 
+  mutate(ff_z= zscore_my(ff, ff[period=="PRE"]))
+
+ffreq2 = ffreq3 %>% 
+  group_by(expt, labels, period, expt_group, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+
+#ffreq2 = ffreq2 %>% ungroup() %>% mutate(expt = factor(expt, levels=drug_date$expt))
+
+ffreq2_base = ffreq2 %>% 
+  filter(period=="PRE") %>%
+  group_by(bird, labels, expt, expt_group) %>%
+  summarize_at(vars(ff_mean, ff_cv), list("mean" = mean))
+
+ffreq2 = ffreq2 %>% left_join(ffreq2_base)
+ffreq2 = ffreq2 %>% left_join(info %>% distinct(expt, date))
+
+ffreq2_group = ffreq2 %>% 
+  group_by(bird, labels, expt, expt_group) %>%
+  mutate(ff_mean_change = perc_change(ff_mean, ff_mean_mean),
+         ff_cv_change = perc_change(ff_cv, ff_cv_mean))
+ffreq2_group = ffreq2_group %>% left_join(info) %>%
+  distinct(expt_group, expt, labels, period, bird, .keep_all=T)
+
+## By hour
+ffreq2_hour = ffreq3 %>% 
+  group_by(expt, labels, rel_mtime_hour, expt_group, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+ffreq2_hour = ffreq2_hour %>% left_join(ffreq2_base)
+ffreq2_hour = ffreq2_hour %>% left_join(info %>% distinct(expt, date))
+
+ffreq2_hour_group = ffreq2_hour %>% 
+  group_by(bird, labels, expt, expt_group) %>%
+  mutate(ff_mean_change = perc_change(ff_mean, ff_mean_mean),
+         ff_cv_change = perc_change(ff_cv, ff_cv_mean))
+
+ffreq2_hour_group = ffreq2_hour_group %>% left_join(info) %>%
+  distinct(expt_group, expt, labels, period, bird, rel_mtime_hour, .keep_all=T)
+
+## By half hour
+ffreq2_hhour = ffreq3 %>% 
+  group_by(expt, labels, rel_mtime_halfhour, expt_group, bird) %>%
+  summarize(ff_mean = mean(ff, na.rm=T),
+            ff_cv = sd(ff, na.rm=T) / ff_mean)
+ffreq2_hhour = ffreq2_hhour %>% left_join(ffreq2_base)
+ffreq2_hhour = ffreq2_hhour %>% left_join(info %>% distinct(expt, date))
+
+ffreq2_hhour_group = ffreq2_hhour %>% 
+  group_by(bird, labels, expt, expt_group) %>%
+  mutate(ff_mean_change = perc_change(ff_mean, ff_mean_mean),
+         ff_cv_change = perc_change(ff_cv, ff_cv_mean))
+
+ffreq2_hhour_group = ffreq2_hhour_group %>% left_join(info) %>%
+  distinct(expt_group, expt, labels, period, bird, rel_mtime_halfhour, .keep_all=T)
+```
+
+```{r}
+ffreq2_group %>% ungroup() %>% select(bird, expt_group) %>% table()
+```
+
+### CV barplots
+```{r}
+colors = c("PBS"="black",
+           "CRH"="red",
+           "AP5"="darkgreen",
+           "PBS-test"="blue",
+           "PBS-control"="blue",
+           "none"="black",
+           "CRH(6-33)" = "darkorange",
+           "CRH/CRH(6-33)" = "purple4")
+```
+
+```{r}
+tmp = ffreq2 %>% filter(!is.na(period))
+gg = ggplot(tmp, aes(expt, ff_cv, fill=period)) 
+gg = gg + geom_bar(position="dodge2", stat="identity")
+gg = gg + facet_grid(labels~., scales="free_y")
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg
+nexpts = length(levels(ffreq2$expt))
+#save_plot(file.path(freq_dir, "ff_cv.pdf"), gg, base_width=1, base_height=2, ncol=nexpts, nrow=2)
+#ggsave(paste(plot_dir, "ff_cv.pdf", sep="/"), width=20, height=6)
+
+```
+
+```{r}
+tmp = ffreq2_group %>% ungroup() %>% 
+  #filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(expt_group %in% c("PBS-test","PBS-control", "AP5", "CRH")) %>% 
+  filter(!(log.drug_conc %in% c("1 uM CRH", "2 uM CRH"))) %>% 
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS-test", "PBS-control", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+ # mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(expt, ff_cv_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge2(), stat="identity")
+gg = gg + facet_grid(labels~., scales="free_y")
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0))
+gg = gg + labs(x = "", y = "FF CV % change from baseline")
+
+gg
+nexpts = length(unique(tmp$expt))
+save_plot(file.path(freq_dir, "ff_cv_change.pdf"), gg, base_width=.5, base_height=2, ncol=nexpts, nrow=2)
+
+```
+## Summary plots
+```{r}
+
+#to_use = ffreq2_group %>% filter(expt_group=="AP5", ff_cv_change<0) %>% ungroup() %>%  distinct(bird, labels)
+#to_use = list("bu2bu50" = c("c", "d"),
+#              "or71or43" = c("d", "r"),
+#              "bu90bu20" = c("e", "r"))
+to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+tmp = ffreq2_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  droplevels() %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE") #%>%
+ # filter(bird=="bu2bu50")
+gg = ggplot(tmp, aes(expt_group, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_point(position = position_jitter(width=.2))
+gg = gg + facet_grid(bird~period, scales="free_y")
+gg = gg + scale_color_manual(values=colors)
+gg = gg + labs(x = "", y = "FF CV, % change from baseline")
+gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg
+save_plot(file.path(freq_dir, "ff_cv_change_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(freq_dir, "ff_cv_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+
+tmp1_sum = tmp %>% group_by(period, expt_group) %>% 
+  summarize_at(vars(ff_cv_change, ff_cv), list(mean="mean_na", sem="sem"))
+
+gg = ggplot(tmp, aes(expt_group, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_point(position = position_jitter(width=.2), alpha=.5)
+gg = gg + geom_pointrange(data= tmp1_sum, aes(y = ff_cv_change_mean, ymin=(ff_cv_change_mean - ff_cv_change_sem), ymax=(ff_cv_change_mean + ff_cv_change_sem)), color="black")
+gg = gg + facet_grid(.~period, scales="free_y")
+gg = gg + scale_color_manual(values=colors)
+gg = gg + labs(x = "", y = "FF CV\n% change from baseline")
+gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + ylim(-50, 100)
+gg
+
+ncols = length(unique(tmp$period))
+save_plot(file.path(freq_dir, "ff_cv_change_expt_group_combined.pdf"), gg, ncol = ncols, nrow=1, base_height = 3)
+
+# bird_test= "or31bk86"
+# tmp_test = tmp %>% filter(bird==bird_test)
+# tmp1_test_sum = tmp1_sum %>% filter(bird==bird_test)
+# gg = ggplot(tmp_test, aes(expt_group, ff_cv_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_point(position = position_jitter(width=.2), alpha=.5)
+# gg = gg + geom_pointrange(data= tmp1_test_sum, aes(y = ff_cv_change_mean, ymin=(ff_cv_change_mean - ff_cv_change_sem), ymax=(ff_cv_change_mean + ff_cv_change_sem)), color="black")
+# gg = gg + facet_grid(labels+bird~period, scales="free_y")
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + labs(x = "", y = "FF CV, % change from baseline")
+# gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+#                 strip.text.y=element_text(angle=0),
+#                 legend.position="none")
+# gg = gg + geom_text(aes(label=expt))
+# gg
+#save_plot(file.path(freq_dir, "ff_cv_change_expt_group_combined.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+#save_plot(file.path(freq_dir, "ff_cv_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+
+
+
+```
+```{r}
+
+#to_use = ffreq2_group %>% filter(expt_group=="AP5", ff_cv_change<0) %>% ungroup() %>%  distinct(bird, labels)
+#to_use = list("bu2bu50" = c("c", "d"),
+#              "or71or43" = c("d", "r"),
+#              "bu90bu20" = c("e", "r"))
+to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+tmp = ffreq2_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  droplevels() %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE") #%>%
+ # filter(bird=="bu2bu50")
+gg = ggplot(tmp, aes(expt_group, ff_mean_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_point(position = position_jitter(width=.2))
+gg = gg + facet_grid(bird~period, scales="free_y")
+gg = gg + scale_color_manual(values=colors)
+gg = gg + labs(x = "", y = "FF mean, % change from baseline")
+gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg
+save_plot(file.path(freq_dir, "ff_mean_change_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(freq_dir, "ff_mean_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+
+tmp1_sum = tmp %>% group_by(period, expt_group) %>% 
+  summarize_at(vars(ff_mean_change, ff_mean), list(mean="mean_na", sem="sem"))
+
+gg = ggplot(tmp, aes(expt_group, ff_mean_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_point(position = position_jitter(width=.2), alpha=.5)
+gg = gg + geom_pointrange(data= tmp1_sum, aes(y = ff_mean_change_mean, ymin=(ff_mean_change_mean - ff_mean_change_sem), ymax=(ff_mean_change_mean + ff_mean_change_sem)), color="black")
+gg = gg + facet_grid(.~period, scales="free_y")
+gg = gg + scale_color_manual(values=colors)
+gg = gg + labs(x = "", y = "FF mean\n% change from baseline")
+gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+#gg = gg + ylim(-50, 100)
+gg
+
+ncols = length(unique(tmp$period))
+save_plot(file.path(freq_dir, "ff_mean_change_expt_group_combined.pdf"), gg, ncol = ncols, nrow=1, base_height = 3)
+
+# bird_test= "or31bk86"
+# tmp_test = tmp %>% filter(bird==bird_test)
+# tmp1_test_sum = tmp1_sum %>% filter(bird==bird_test)
+# gg = ggplot(tmp_test, aes(expt_group, ff_cv_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_point(position = position_jitter(width=.2), alpha=.5)
+# gg = gg + geom_pointrange(data= tmp1_test_sum, aes(y = ff_cv_change_mean, ymin=(ff_cv_change_mean - ff_cv_change_sem), ymax=(ff_cv_change_mean + ff_cv_change_sem)), color="black")
+# gg = gg + facet_grid(labels+bird~period, scales="free_y")
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + labs(x = "", y = "FF CV, % change from baseline")
+# gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+#                 strip.text.y=element_text(angle=0),
+#                 legend.position="none")
+# gg = gg + geom_text(aes(label=expt))
+# gg
+#save_plot(file.path(freq_dir, "ff_cv_change_expt_group_combined.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+#save_plot(file.path(freq_dir, "ff_cv_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+
+
+
+```
+
+T-test
+```{r}
+# tmp_t = tmp %>% 
+#   group_by(period) %>%
+#   do(ttest_res = t.test(.$ff_cv_change[.$expt_group=="PBS"], .$ff_cv_change[.$expt_group=="CRH"])) %>% tidy(ttest_res)
+# tmp_t
+# 
+# tmp_t = tmp %>% group_by(period) %>% do(ttest_res = t.test(.$ff_cv_change[.$expt_group=="PBS"], .$ff_cv_change[.$expt_group=="AP5"])) %>% tidy(ttest_res)
+# tmp_t
+
+```
+
+```{r}
+# tmp = ffreq2_group %>% ungroup() %>% 
+#   filter(date > "2018-03-03", date < "2018-03-22") %>%
+#     filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+#   filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+#   mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+#   arrange(expt_group) %>%
+#   mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+#   filter(!is.na(expt)) %>%
+#   filter(period != "PRE")
+# gg = ggplot(tmp, aes(expt_group, ff_mean_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_point(position = position_jitter(width=.2))
+# gg = gg + facet_grid(labels~period, scales="free_y")
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + labs(x = "", y = "FF, % change from baseline")
+# gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+#                 strip.text.y=element_text(angle=0),
+#                 legend.position="none")
+# gg
+# save_plot(file.path(plot_dir, "ff_mean_change_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+# save_plot(file.path(plot_dir, "ff_mean_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+```
+
+T-test
+```{r}
+# tmp_t = tmp %>% group_by(period, labels) %>% do(ttest_res = t.test(.$ff_mean_change[.$expt_group=="PBS"], .$ff_mean_change[.$expt_group=="CRH"])) %>% tidy(ttest_res)
+# tmp_t
+```
+
+## Significance testing relative to PBS
+```{r}
+source("~/nest/rstudio/utils/mixed_model2.R")
+```
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+redo = T
+fname = file.path(data_dir, "relative_to_vehicle.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(matches(value)), rename_func)
+    
+    tmp %>% 
+      #group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", #"w", "c",
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq2_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+  
+  des = value ~ expt_group + (1 | bird / labels)
+  
+  vars_cur_z = c("ff_cv_change", "ff_mean_change")
+  drugs = c("AP5", "CRH")
+  periods = c("DRUG", "POST")
+  mods = map(vars_cur_z, function(x) {
+    print(x)
+    map(drugs, function(drug) {
+    #map(post_rel_dates, function(y) {
+     print(drug)
+      map(periods, function(p) {
+    
+      cur1 = cur %>% 
+        filter(expt_group %in% c(drug, "PBS-control")) %>%
+        filter(period == p) %>%
+        droplevels()
+        #group_by(bird, period, log.sirna2, labels) %>%
+        #sample_n(200) %>%
+        #ungroup()
+      run_lmer_model(cur1, des, x)
+      }) %>% 
+        set_names(periods) %>% 
+        bind_rows(.id="period") 
+    }) %>% 
+      set_names(drugs) %>% 
+      bind_rows(.id="expt_group")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="expt_group") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup()
+
+mods_p
+```
+```{r}
+mods_ex = mods %>% filter(grepl("expt_group[AP5|CRH]", coef)) %>% dplyr::select(variable, period, coef, coef_type, value) %>%
+  spread(coef_type, value) %>%
+  mutate(expt_group = sub("expt_group", "", coef))
+mods_ex_cur = mods_ex %>% filter(variable=="ff_cv_change")# %>%
+  #filter(period=="DRUG")
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate))
+gg = gg + geom_bar(stat="identity", aes(fill=expt_group))
+gg = gg + geom_segment(aes(xend=expt_group, y=(estimate - std.error),
+                              yend=(estimate + std.error)), color="black")
+gg = gg + labs(y="% change relative to vehicle", x = "")
+gg = gg + facet_grid(~period)
+gg = gg + scale_fill_manual(values=colors)
+gg
+#save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_bar.pdf"), gg, base_height=3)
+
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate, color=expt_group))
+gg = gg + geom_pointrange(aes(ymin=(estimate - std.error), ymax=(estimate + std.error)))
+gg = gg + labs(y="% change relative to vehicle", x = "")
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + scale_color_manual(values=colors)
+gg
+#save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_point.pdf"), gg, base_height=3)
+
+```
+
+
+```{r}
+tmp = ffreq2_group %>% ungroup() %>%
+ filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+    filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  #mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(ff_mean_change, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_point()
+gg = gg + scale_color_manual("", values=colors)
+gg = gg + facet_grid(labels~period)
+gg = gg + labs(x="FF % change", y="FF CV % change")
+gg
+fname = "ff_mean_change_vs_ff_cv_change.pdf"
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5, base_aspect_ratio = 1.3)
+```
+
+
+## Significance testing relative to PRE
+```{r}
+source("~/nest/rstudio/utils/mixed_model2.R")
+```
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+redo = T
+fname = file.path(data_dir, "relative_to_pre.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(value), rename_func)
+    
+    tmp %>% 
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq2_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+  
+  des = value ~ period + (1 | bird / labels)
+  
+  vars_cur_z = c("ff_cv", "ff_mean", "ff_cv_change", "ff_mean_change")
+  drugs = c("AP5", "CRH", "PBS-control")
+  periods = c("DRUG", "POST")
+  mods = map(vars_cur_z, function(x) {
+    print(x)
+    map(drugs, function(drug) {
+    #map(post_rel_dates, function(y) {
+     print(drug)
+      map(periods, function(p) {
+      print(p)
+      cur1 = cur %>% 
+        filter(expt_group %in% c(drug)) %>%
+        filter(period %in% c(p, "PRE")) %>%
+        droplevels()
+        #group_by(bird, period, log.sirna2, labels) %>%
+        #sample_n(200) %>%
+        #ungroup()
+      run_lmer_model(cur1, des, x)
+      }) %>% 
+        set_names(periods) %>% 
+        bind_rows(.id="period") 
+    }) %>% 
+      set_names(drugs) %>% 
+      bind_rows(.id="expt_group")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="expt_group") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup()
+
+mods_p
+```
+```{r}
+mods %>% filter(level=="fixed", period=="DRUG") %>% filter(grepl("period", coef))
+```
+
+
+```{r}
+mods_ex = mods %>% filter(grepl("period[DRUG|POST]", coef)) %>% 
+  dplyr::select(variable, period, coef, coef_type, value, expt_group) %>%
+  spread(coef_type, value) %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH")))
+mods_ex_cur = mods_ex %>% filter(variable=="ff_cv_change") #%>%
+  #filter(period=="DRUG")
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate))
+gg = gg + geom_bar(stat="identity", aes(fill=expt_group))
+gg = gg + geom_segment(aes(xend=expt_group, y=(estimate - std.error),
+                              yend=(estimate + std.error)), color="black")
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + scale_fill_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none")
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_bar.pdf"), gg, base_height=3, ncol=2)
+
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate, color=expt_group))
+gg = gg + geom_pointrange(aes(ymin=(estimate - std.error), ymax=(estimate + std.error)))
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none") +
+  ylim(-25, 25)
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_point.pdf"), gg, base_height=3, ncol=2)
+
+```
+
+
+```{r}
+tmp = ffreq2_group %>% ungroup() %>%
+ filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+    filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(ff_mean_change, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_point()
+gg = gg + scale_color_manual("", values=colors)
+gg = gg + facet_grid(labels~period)
+gg = gg + labs(x="FF % change", y="FF CV % change")
+gg
+fname = "ff_mean_change_vs_ff_cv_change.pdf"
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5, base_aspect_ratio = 1.3)
+```
+
+
+Reduction in CV with AP5 in syllabe D, general trend toward increased CV with CRH, but not consistent
+```{r}
+gg = ggplot(ungroup(ffreq3), aes(ff_z, color=period))
+gg = gg + geom_density()
+gg = gg + facet_grid(expt~labels)
+gg
+```
+
+## Significance testing relative to PRE - by hour
+```{r}
+source("~/nest/rstudio/utils/mixed_model2.R")
+```
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+redo = T
+fname = file.path(data_dir, "relative_to_pre_hour.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(value), rename_func)
+    
+    tmp %>% 
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq2_hour_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+  
+  des = value ~ period + (1 | bird / labels)
+  
+  vars_cur_z = c("ff_cv", "ff_mean", "ff_cv_change")
+  drugs = c("AP5", "CRH", "PBS-control")
+  hours = seq(1, 4)
+  mods = map(vars_cur_z, function(x) {
+    print(x)
+    map(drugs, function(drug) {
+    #map(post_rel_dates, function(y) {
+     print(drug)
+      map(hours, function(hr) {
+      print(hr)
+      cur1 = cur %>% 
+        filter(expt_group %in% c(drug)) %>%
+        filter(period == "PRE" | rel_mtime_hour == hr) %>%
+        droplevels()
+        #group_by(bird, period, log.sirna2, labels) %>%
+        #sample_n(200) %>%
+        #ungroup()
+      run_lmer_model(cur1, des, x)
+      }) %>% 
+        set_names(hours) %>% 
+        bind_rows(.id="rel_mtime_hour") 
+    }) %>% 
+      set_names(drugs) %>% 
+      bind_rows(.id="expt_group")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="expt_group") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup()
+
+mods_p
+```
+
+```{r}
+mods_ex = mods %>% filter(grepl("period[DRUG|POST]", coef)) %>% 
+  dplyr::select(variable, period, coef, coef_type, value, expt_group) %>%
+  spread(coef_type, value) %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH")))
+mods_ex_cur = mods_ex %>% filter(variable=="ff_cv_change") #%>%
+  #filter(period=="DRUG")
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate))
+gg = gg + geom_bar(stat="identity", aes(fill=expt_group))
+gg = gg + geom_segment(aes(xend=expt_group, y=(estimate - std.error),
+                              yend=(estimate + std.error)), color="black")
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + scale_fill_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none")
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_bar.pdf"), gg, base_height=3, ncol=2)
+
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate, color=expt_group))
+gg = gg + geom_pointrange(aes(ymin=(estimate - std.error), ymax=(estimate + std.error)))
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none") +
+  ylim(-25, 25)
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_point.pdf"), gg, base_height=3, ncol=2)
+
+```
+
+
+```{r}
+tmp = ffreq2_group %>% ungroup() %>%
+ filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+    filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(ff_mean_change, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_point()
+gg = gg + scale_color_manual("", values=colors)
+gg = gg + facet_grid(labels~period)
+gg = gg + labs(x="FF % change", y="FF CV % change")
+gg
+fname = "ff_mean_change_vs_ff_cv_change.pdf"
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5, base_aspect_ratio = 1.3)
+```
+
+
+Reduction in CV with AP5 in syllabe D, general trend toward increased CV with CRH, but not consistent
+```{r}
+gg = ggplot(ungroup(ffreq3), aes(ff_z, color=period))
+gg = gg + geom_density()
+gg = gg + facet_grid(expt~labels)
+gg
+```
+
+
+
+## Significance testing relative to PRE - by halfhour
+
+```{r}
+to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq2_hour_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+
+gg = ggplot(cur, aes(rel_mtime_halfhour, ff_cv_change)) + 
+  geom_point(alpha=.2) + 
+  stat_smooth() + 
+  geom_hline(yintercept=0, linetype=3) + 
+  geom_vline(xintercept=0, linetype=1) +
+  facet_wrap(~expt_group) + 
+  ylim(-50, 75) + 
+  xlim(-2, 8)
+gg
+```
+
+```{r}
+to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq3  %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+
+gg = ggplot(cur, aes(rel_mtime_halfhour, ff_z)) + 
+  geom_point(alpha=.2) + 
+  stat_smooth() + 
+  geom_hline(yintercept=0, linetype=3) + 
+  geom_vline(xintercept=0, linetype=1) +
+  facet_wrap(~expt_group)# + 
+ # ylim(-50, 75)
+gg
+```
+
+```{r}
+source("~/nest/rstudio/utils/mixed_model2.R")
+```
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+redo = T
+fname = file.path(data_dir, "relative_to_pre_hour.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(value), rename_func)
+    
+    tmp %>% 
+      do({
+        d = .
+        mod = lme4::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  #nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  #nsyls = nsyls %>% filter(n>200)
+  to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))
+
+to_use_dates = data.frame(bird=c("bu2bu50", "or71or43", "bu90bu20", "or31bk86"),
+                          date1 = as.Date(c("2018-03-03", "2015-01-01", "2015-01-01", "2019-02-12")),
+                          date2 = as.Date(c("2018-03-22", "2020-01-01", "2020-01-01", "2019-02-28")))
+cur = ffreq2_hour_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  #filter(period == "DRUG") %>% 
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"))) %>% 
+  droplevels() 
+
+  
+  des = value ~ period + (1 | bird / labels)
+  
+  vars_cur_z = c("ff_cv", "ff_mean", "ff_cv_change")
+  drugs = c("AP5", "CRH", "PBS-control")
+  hours = unique(info$rel_mtime_halfhour)
+  hours = hours[hours>0]
+  mods = map(vars_cur_z, function(x) {
+    print(x)
+    map(drugs, function(drug) {
+    #map(post_rel_dates, function(y) {
+     print(drug)
+      map(hours, function(hr) {
+      print(hr)
+      cur1 = cur %>% 
+        filter(expt_group %in% c(drug)) %>%
+        filter(period == "PRE" | rel_mtime_halfhour == hr) %>%
+        droplevels()
+        #group_by(bird, period, log.sirna2, labels) %>%
+        #sample_n(200) %>%
+        #ungroup()
+      run_lmer_model(cur1, des, x)
+      }) %>% 
+        set_names(hours) %>% 
+        bind_rows(.id="rel_mtime_halfhour") 
+    }) %>% 
+      set_names(drugs) %>% 
+      bind_rows(.id="expt_group")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="expt_group") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup()
+
+mods_p
+```
+
+```{r}
+mods_ex = mods %>% filter(grepl("period[DRUG|POST]", coef)) %>% 
+  dplyr::select(variable, period, coef, coef_type, value, expt_group) %>%
+  spread(coef_type, value) %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH")))
+mods_ex_cur = mods_ex %>% filter(variable=="ff_cv_change") #%>%
+  #filter(period=="DRUG")
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate))
+gg = gg + geom_bar(stat="identity", aes(fill=expt_group))
+gg = gg + geom_segment(aes(xend=expt_group, y=(estimate - std.error),
+                              yend=(estimate + std.error)), color="black")
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + scale_fill_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none")
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_bar.pdf"), gg, base_height=3, ncol=2)
+
+gg = ggplot(mods_ex_cur, aes(expt_group, estimate, color=expt_group))
+gg = gg + geom_pointrange(aes(ymin=(estimate - std.error), ymax=(estimate + std.error)))
+gg = gg + labs(y="% change relative to baseline", x = "")
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~period)
+gg = gg + theme(legend.position="none") +
+  ylim(-25, 25)
+gg
+save_plot(file.path(plot_dir, "ff_cv_change_rel_vehicle_lme_point.pdf"), gg, base_height=3, ncol=2)
+
+```
+
+
+```{r}
+tmp = ffreq2_group %>% ungroup() %>%
+ filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+    filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(ff_mean_change, ff_cv_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_point()
+gg = gg + scale_color_manual("", values=colors)
+gg = gg + facet_grid(labels~period)
+gg = gg + labs(x="FF % change", y="FF CV % change")
+gg
+fname = "ff_mean_change_vs_ff_cv_change.pdf"
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5, base_aspect_ratio = 1.3)
+```
+
+
+Reduction in CV with AP5 in syllabe D, general trend toward increased CV with CRH, but not consistent
+```{r}
+gg = ggplot(ungroup(ffreq3), aes(ff_z, color=period))
+gg = gg + geom_density()
+gg = gg + facet_grid(expt~labels)
+gg
+```
+
+
+
+## Compare AP5 and CRH responses
+```{r}
+tmp = ffreq2_group %>% ungroup() %>% 
+  left_join(to_use_dates) %>% 
+  filter(date > date1, date < date2)  %>% 
+  filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning, bu2bu50
+  #inner_join(to_use) %>% 
+  filter(!grepl(c("[1|2] uM CRH"), expt)) %>% 
+  filter(expt_group %in% c("PBS-control", "AP5", "CRH")) %>% 
+  droplevels() %>%
+  mutate(expt_group = factor(expt_group, levels=c("PBS-control", "AP5", "CRH"), labels=c("PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE") 
+
+tmp_mean = tmp %>% 
+  filter(expt_group != "PBS") %>% 
+  group_by(bird, labels, expt_group, period) %>% 
+  summarize(ff_cv_change_mean = mean(ff_cv_change),
+            ff_mean_change_mean = mean(ff_mean_change))
+tmp_mean_ex = tmp_mean %>% 
+  select(bird, labels, expt_group, period, ff_cv_change_mean) %>% 
+  spread(expt_group, ff_cv_change_mean) %>% 
+  filter(period=="DRUG")
+gg = ggplot(tmp_mean_ex, aes(AP5, CRH, color=bird))
+gg = gg + geom_text(aes(label=labels))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + stat_smooth(method="lm", se=F, inherit.aes=F, aes(AP5, CRH))
+
+gg
+```
+
+  to_use = data.frame(bird = c(rep("bu2bu50", 1), 
+                             rep("or71or43", 2),
+                             rep("bu90bu20", 2),
+                             rep("or31bk86", 2)),
+                    labels = c( "d", 
+                                "d", "r", 
+                                "e", "r",
+                                "d", "f"))

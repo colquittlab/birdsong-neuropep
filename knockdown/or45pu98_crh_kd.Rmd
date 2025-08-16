@@ -1,0 +1,2020 @@
+---
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+```{r}
+library(R.matlab)
+library(stringr)
+library(parallel)
+library(lubridate)
+library(Cairo)
+source("~/src/songanalysis/song_util.R")
+source("~/src/songanalysis/song_db.R")
+source("~/src/songanalysis/song_ff.R")
+source("~/src/songanalysis/deafen_plot.R")
+source("~/src/songanalysis/song_plot.R")
+source("~/data2/rstudio/birds/utils/dialysis.R")
+source("~/data2/rstudio/birds/utils/hvc.R")
+source("~/data2/rstudio/birds/utils/db.R")
+library(tidyverse)
+library(broom)
+library(here)
+library(cowplot)
+library(ggridges)
+```
+
+```{r}
+registerDoMC(cores=6)
+```
+
+```{r}
+filter = dplyr::filter
+summarize = dplyr::summarize
+mutate = dplyr::mutate
+select = dplyr::select
+here = here::here
+```
+
+# Load info 
+```{r}
+prefix_song = "/mnt/bengal_home/song"
+prefix_data = here()
+prefix_data = "~/data2/rstudio/birds/deafen/song_analysis/knockdown/"
+```
+
+```{r}
+bird = "or45pu98"
+```
+
+```{r}
+songs_dir = file.path(prefix_song, bird, "songs")
+data_dir = file.path(prefix_data, bird)
+dir.create(data_dir, recursive=T) 
+plot_dir = paste(data_dir, "figures", sep="/")
+dir.create(plot_dir, recursive=T)
+```
+
+
+```{r}
+options(httr_oob_default=TRUE)
+```
+
+```{r}
+dates_to_proc = list(c("songs"))
+dial_log = load_knockdown_gs(bird)
+info = map(dates_to_proc, ~load_song_info_event(bird, .x[1], subdir="", log_data=dial_log, tz="PDT")) %>%
+ bind_rows()
+info = info %>% distinct(wav, .keep_all=T)
+```
+
+
+```{r}
+info = info %>% mutate(period = if_else(rel_date<=0, "PRE", "POST"))
+```
+
+```{r}
+info = info %>% mutate(wav_base = basename(wav),
+                        mat_base = basename(mat))
+## Remove double backslashes
+info = info %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+
+```
+
+# Set up data db
+```{r}
+db = src_sqlite(paste(data_dir, sprintf("%s.db", bird), sep="/"), create=T)
+```
+
+# Plotting
+```{r}
+by_day = file.path(plot_dir, "by_day")
+dir.create(by_day)
+
+across_days = file.path(plot_dir, "across_days")
+dir.create(across_days)
+```
+
+```{r}
+hl = geom_hline(yintercept=0, linetype=3)
+th = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1),
+                        strip.text.y = element_text(angle=0))
+li = ylim(-6, 6)
+scc = scale_color_manual("", values=c("red", "black", "blue"))
+scx = scale_x_datetime(date_breaks="4 hours", 
+                   labels=date_format("%m-%d %H:%M",
+                                      tz="America/Los_Angeles"))
+gu = guides(colour = guide_legend(override.aes = list(alpha=1)))
+xl = xlab("")
+yl = ylab("Z-score")
+fig_width=8
+fig_height=8
+
+#segs = geom_segment(data=evtaf_log %>% filter(!is.na(ff.threshold)), aes(x=datetime, xend=datetime_stop, y=ff.threshold, yend=ff.threshold), color="red", linetype=1)
+```
+
+```{r}
+plot_across_time_current = function(data, value, drug_times1) {
+  gg = plot_within_day(data , value, 
+                       x_value = "rel_mtime",
+                       #datetime_sections = drug_times1,
+                       group_factor = NULL,
+                       facet_factor = "labels", 
+                       color_factor = NULL, 
+                       alpha=.1)
+  gg = gg + facet_wrap(~labels, scales="free_x")
+  gg = gg + th + gu + xl + yl + scc
+  gg = gg + labs(title=value)
+  gg
+}
+```
+
+```{r}
+plot_grouped_current = function(data, value, group) {
+  gg = ggplot(data, aes_string(group, value, color=group))
+  gg = gg + ggp + gf + gth + gli + ghl + gxl
+  ggsave(paste(plot_dir, sprintf("%s_group.pdf", value), sep="/"), plot=gg, width=8, height=8)
+  return(gg)
+}
+```
+
+
+# Load features
+```{r}
+reload=T
+tname3 = "syls"
+if (reload) {
+  base_dir = "/mnt/bengal_home/song/%s/songs/autolabel"
+
+  data_dirs = map(unique(info$bird), ~sprintf(base_dir, .x))
+  data_files = map(data_dirs, function(x) {
+    list.files(x, pattern=".db$", full.names = T)
+  })
+
+  features = map(data_files, load_hvc_db)
+  syls = bind_rows(features)
+  
+  redo = T
+  if (redo && db_has_table(db$con, tname3))
+    db_drop_table(db$con, tname3)
+  copy_to(db, syls, tname3, temporary=F)
+} else {
+  syls = collect(tbl(db, tname3), n=Inf)
+}
+
+## Synchronize with current songs directory
+syls = syls %>% filter(wav %in% info$wav)
+
+
+syls = syls %>% rename(went_mean = mean_spectral_flatness,
+                         amp_mean = mean_amplitude)
+
+syls = syls %>% mutate(wav_base = basename(wav))
+```
+
+```{r}
+syls1 = left_join(syls %>% select(-wav), info)
+#syls1 = syls1 %>% filter(!is.na(expt))
+syls1 = syls1 %>% filter(!(labels %in% c(" ", "-")))
+
+```
+
+### Filter by date range
+```{r}
+syls1 = syls1 %>% filter(rel_date>=-4)
+```
+
+### Extract pre and post syllables
+```{r message=FALSE, warning=FALSE}
+syls1 = syls1 %>% group_by(mat) %>% filter(n()>3) %>% do({
+    mat = .
+    mat = mat %>% mutate(labels=as.character(labels)) %>%
+                         #id1 = as.numeric(map_chr(str_split(id, "-"), 2))) %>%
+      arrange(onsets)
+    matpre = vector("character", length = nrow(mat))
+    matpost = vector("character", length = nrow(mat))
+
+    matpre[1] = "start"
+    for (i in 2:nrow(mat)) {
+      matpre[i] = mat$labels[i-1]
+    }
+    for (i in 1:(nrow(mat)-1)) {
+      matpost[i] = mat$labels[i+1]
+    }
+    matpost[length(matpost)] = "end"
+
+    data.frame(mat, matpre, matpost, stringsAsFactors=F)
+  }) %>% ungroup()
+syls1 = syls1 %>% mutate(labels_con = paste(matpre, toupper(labels), sep=""),
+                         labels_div = paste(toupper(labels), matpost, sep=""))
+```
+
+
+### Filter out poorly classified syllables
+```{r}
+syls1 = syls1 %>% filter(pred_ent < .5)
+```
+
+```{r}
+syls1 = syls1 %>% mutate(went_mean_log2 = log2(went_mean),
+                        # went_var_log2 = log2(went_var),
+                         amp_mean_log2 = log2(amp_mean),
+                         went_mean_norm_amp_mean_log2 = went_mean_log2 + amp_mean_log2)
+```
+
+```{r}
+safe_lm = function(d) {
+  d = d[! (is.na(d$went_mean_log2) | is.na(d$amp_mean_log2)),]
+  if (nrow(d) < 10) {
+    return(data.frame(went_mean_log2_res = NA,
+                      went_mean_log2_res2 = NA,
+                      went_mean_log2=NA,
+                      mat=NA))
+  }
+  mod = lm(went_mean_log2 ~ amp_mean_log2, data=d)
+  mod2 = lm(went_mean_log2 ~ stats::poly(amp_mean_log2,2), data=d)
+  #mod = lm(went_mean_log2 ~ amp_mean_log2, data=d)
+  
+  return(data.frame(went_mean_log2_res=residuals(mod),
+                    went_mean_log2_res2=residuals(mod2),
+                  #  went_mean_log2_res3=residuals(mod3),
+                    went_mean_log2=d$went_mean_log2, 
+                    mat=d$mat))
+}
+lms = syls1 %>% group_by(bird, labels) %>% do({
+  d = .
+  safe_lm(d)
+})
+syls1 = left_join(syls1, lms)
+```
+
+```{r}
+gg = ggplot(syls1 %>% group_by(labels) %>% sample_frac(.1) %>% ungroup(), aes(amp_mean_log2, went_mean_log2)) + geom_point(alpha=.1) + facet_wrap(~labels)
+gg
+
+gg = ggplot(syls1 %>% group_by(labels) %>% sample_frac(.1) %>% ungroup(), aes(amp_mean_log2, went_mean_log2_res)) + geom_point(alpha=.1) + facet_wrap(~labels)
+gg
+
+gg = ggplot(syls1 %>% group_by(labels) %>% sample_frac(.1) %>% ungroup(), aes(amp_mean_log2, went_mean_log2_res2)) + geom_point(alpha=.1) + facet_wrap(~labels)
+gg
+
+
+```
+
+```{r}
+vars_cur = vars(went_mean_log2, went_mean_log2_res, went_mean_log2_res2, amp_mean_log2, duration, 
+                mean_spectral_centroid,
+                mean_spectral_spread, mean_spectral_skewness, mean_spectral_kurtosis,
+                mean_spectral_slope, mean_pitch, mean_pitch_goodness, 
+                mean_delta_spectral_flatness, mean_delta_pitch,
+                pred_ent)
+
+syls1 = syls1 %>% mutate(baseline = rel_date<=0)
+syls1a = syls1 %>% group_by(bird, labels) %>%
+  do({
+    d = .
+    d  %>% mutate_at(vars_cur, list(z = "zscore_my"), baseline=d$baseline)
+     
+  })
+
+syls1a = syls1a %>% ungroup()# %>% mutate(expt = factor(expt, levels=drug_date$expt))
+```
+
+## Plot features
+### Across time
+```{r fig.height=10, fig.width=5}
+values = c("duration_z", "went_mean_log2_z", "went_mean_log2_res_z", "went_mean_log2_res2_z", "mean_pitch_goodness_z", "mean_delta_spectral_flatness_z", "amp_mean_log2_z", "mean_pitch_z", "mean_delta_pitch_z", "pred_ent_z")
+tmp = syls1a %>% sample_frac(.1)
+walk(values, function(value) {
+  print(value)
+  gg = plot_across_time_current(tmp, value)
+  gg = gg + facet_grid(labels~.)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + ylim(-10, 10)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  nr = length(unique(syls1a$labels))
+  print(gg)
+  save_plot(file.path(by_day, sprintf("%s_time.pdf", value)), gg, base_height=3, base_width=6, nrow=nr, ncol=1)
+})
+```
+
+### Grouped
+```{r}
+group_dir = file.path(plot_dir, "grouped")
+dir.create(group_dir)
+```
+
+# Frequency
+## Average spectrogram
+```{r}
+spec_dir = file.path(plot_dir, "specs")
+dir.create(spec_dir)
+
+freq_dir = file.path(plot_dir, "ff")
+dir.create(freq_dir)
+```
+
+
+
+```{r}
+labels = list(or45pu98 =c("d", "v"))
+```
+
+```{r}
+for (i in 1:length(labels)) {
+  cur_bird = names(labels)[i]
+  label = labels[[i]]
+  tmp = info %>% filter(bird==cur_bird)
+  for (l in label) {
+    print(l)
+
+    psd = calc_average_spectrogram(tmp[sample(1:nrow(tmp), 20),], label=l)
+    gg = plot_average_spectrogram(psd)
+    gg = gg + labs(title=sprintf("%s - %s", cur_bird, l))
+    print(gg)
+    save_plot(file.path(spec_dir, sprintf("average_spec_%s_%s.pdf", cur_bird, l)), gg, base_height=5)
+  }
+}
+```
+
+## Calc FF
+```{r}
+params1 = data.frame(bird="or45pu98",
+                    labels =labels[[1]],
+                    lbuffer=c(.055, .03),
+                  #  rbuffer = c(.02, .03, .0),
+                    freq_lower = c(2.5, 2),
+                    freq_upper = c( 3.5, 3),
+                    stringsAsFactors = F)
+
+params = params1
+```
+
+
+```{r}
+#comb1 = comb %>% filter(grepl("output_1518297110.wav", wav))
+#comb1 = comb %>% filter(rel_date==2)
+info1 = info %>% filter(rel_date>=-4)
+drop = F
+redo = T
+wl = 1024
+tname = sprintf("ff3_%s_55", wl)
+if (!db_has_table(db$con, tname) || redo) {
+  
+  if (drop && db_has_table(db$con, tname))
+    db_drop_table(db$con, tname)
+  ffreq = calc_ff2_batch3(info1, 
+                          wl = wl,
+                          subsample = NULL,
+                          params = params,
+                          audio_input = "wav", 
+                          method = "ff3",
+                          data_db=db,
+                          
+                          tname=tname,
+                          replace_data=F,
+                          parallel=F)
+} else {
+  ffreq = collect(tbl(db, tname))
+}
+ffreq = ffreq %>% distinct(id, .keep_all=T)
+
+## Synchronize with current songs directory
+ffreq = ffreq %>% filter(wav %in% info$wav)
+
+``` 
+
+```{r}
+ffreq1 = ffreq %>% left_join(info)
+ffreq1 = ffreq1 %>% left_join(syls1 %>% select(wav, onsets, labels, pred_ent, duration, labels_con,labels_div))
+ffreq1 = ffreq1 %>% mutate(mtime_onsets = mtime + seconds(onsets))
+ffreq1 = ffreq1 %>% filter(pred_ent<.5)
+```
+```{r}
+#labels_con_to_use = c("cD", "dD", "fG")
+#ffreq1 = ffreq1 %>% filter(labels_con %in% labels_con_to_use)
+```
+
+
+```{r}
+ffreq1 %>%
+  group_by(labels) %>%
+  summarize(mean=mean(ff, na.rm=T),
+            num_na = sum(is.na(ff)),
+            num_not_na = sum(!is.na(ff)))
+```
+
+## Duration QC
+```{r}
+walk(unique(ffreq1$labels), function(lab) {
+  gg = ggplot(ffreq1 %>% filter(labels==lab), aes(duration, ff))
+  gg = gg + geom_point(alpha=.05)
+  gg = gg + facet_wrap(~rel_date) 
+  gg = gg + labs(title=lab)
+ # gg = gg + ylim(1, 4)
+  print(gg)
+  
+  gg = ggplot(ffreq1 %>% ungroup() %>% filter(labels==lab), aes(duration, ff))
+  gg = gg + geom_point(alpha=.05)
+  gg = gg + stat_smooth()
+  gg = gg + labs(title=lab)
+#    gg = gg + ylim(3,4)
+  print(gg)
+})
+```
+
+
+```{r fig.height=10}
+gg = ggplot(ffreq1, aes(duration))
+gg = gg + geom_density()
+gg = gg + facet_grid(rel_date~labels, scale="free")
+gg
+```
+
+```{r}
+#ffreq1 = ffreq1 %>% filter(duration<.1)
+```
+
+## FF plotting functions
+```{r}
+hl = geom_hline(yintercept=0, linetype=3)
+th = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1),
+                        strip.text.y = element_text(angle=0))
+li = ylim(-6, 6)
+scc = scale_color_manual("", values=c("red", "black", "blue"))
+scx = scale_x_datetime(date_breaks="4 hours", 
+                   labels=date_format("%m-%d %H:%M",
+                                      tz="America/Los_Angeles"))
+gu = guides(colour = guide_legend(override.aes = list(alpha=1)))
+xl = xlab("")
+yl = ylab("Z-score")
+fig_width=8
+fig_height=8
+
+#segs = geom_segment(data=evtaf_log %>% filter(!is.na(ff.threshold)), aes(x=datetime, xend=datetime_stop, y=ff.threshold, yend=ff.threshold), color="red", linetype=1)
+```
+
+
+```{r}
+plot_across_time_current = function(data, value, drug_times1) {
+
+  gg = plot_within_day(data , value,
+                       x_value = "rel_mtime",
+                       group_factor = NULL,
+                       facet_factor = "labels", 
+                        color_factor = NULL, 
+                       alpha=.1)
+  gg = gg + facet_grid(labels~., scales="free_x") 
+  gg = gg + th + gu + xl + yl + scc
+  gg = gg + labs(title=value)
+    #gg = gg + segs
+  gg
+}
+
+plot_across_days = function(data, value, drug_times1) {
+
+  gg = plot_within_day(data , value,
+                       x_value = "mtime_onsets",
+                       group_factor = NULL,
+                       facet_factor = NULL, 
+                       color_factor = "log.drug", 
+                       alpha=.1)
+ # gg = gg + facet_grid(labels~expt, scales="free_x") 
+  gg = gg + th  + gu + xl + yl + scc
+  gg = gg + labs(title=value)
+    #gg = gg + segs
+  gg
+}
+```
+
+
+# No context
+```{r}
+min_date = -2
+ffreq1 = ffreq1 %>% filter(rel_date >=min_date)
+```
+
+## Summaries
+```{r}
+ffreq1 %>% select(rel_date, labels) %>% table()
+```
+
+```{r}
+ffreq1 = ffreq1 %>% group_by(labels) %>% do({
+  d = .
+  print(d$labels[1])
+  d = d %>% filter(!is.na(ff)) %>%
+    filter(!is.na(duration))
+  mod = loess(ff~duration, d)
+  res = residuals(mod)
+  
+  
+  data.frame(d, ff_loess = res)
+})
+```
+
+```{r}
+ffreq2 = ffreq1 %>%
+  group_by(labels_con) %>% 
+  summarize(mean_ff = mean(ff, na.rm=T), sd_thresh = 5 * sd(ff, na.rm=T)) %>% 
+  mutate(freq_low = mean_ff - sd_thresh,
+         freq_high = mean_ff + sd_thresh)
+
+ffreq1 = ffreq1 %>% 
+  left_join(ffreq2)
+
+ ffreq1 = ffreq1 %>% 
+   left_join(params)
+
+ffreq3 = ungroup(ffreq1) %>% filter(ff > freq_lower, ff < freq_upper)
+
+ffreq3 = ffreq3 %>%
+  group_by(labels, labels_con) %>% 
+  mutate(ff_z= zscore_my(ff, ff[rel_date<0]),
+         ff_loess_z = zscore_my(ff_loess, ff_loess[rel_date<0]))
+
+ffreq2 = ffreq3 %>% 
+  group_by(labels, labels_con, period, rel_date) %>%
+  summarize_at(vars(ff, ff_loess, duration),
+               list(mean= "mean_na", cv = "calc_cv"))
+  #summarize(ff_mean = mean(ff, na.rm=T),
+  ##          ff_cv = sd(ff, na.rm=T) / ff_mean,
+  #          duration_mean = mean(duration),
+  #          duration_cv = calc_cv(duration))
+
+ffreq2 = ffreq2 %>% ungroup() %>% mutate(period = factor(period, levels=c("PRE", "POST")))
+
+ffreq2_base = ffreq2 %>% filter(rel_date <0) %>% 
+  group_by(labels, labels_con) %>% 
+  summarize_at(vars(ff_mean, ff_cv, ff_loess_mean, ff_loess_cv, duration_mean, duration_cv), list("mean" = mean))
+  
+ffreq2 = ffreq2 %>% left_join(ffreq2_base)
+ffreq2_group = ffreq2 %>% 
+  group_by(labels, labels_con, rel_date) %>%
+  mutate(ff_mean_change = perc_change(ff_mean, ff_mean_mean),
+         ff_cv_change = perc_change(ff_cv, ff_cv_mean),
+         ff_loess_mean_change = perc_change(ff_loess_mean, ff_loess_mean_mean),
+         ff_loess_cv_change = perc_change(ff_loess_cv, ff_loess_cv_mean),
+         duration_cv_change = perc_change(duration_cv, duration_cv_mean))
+
+ffreq2_group = ffreq2_group %>% left_join(info) %>%
+  distinct(labels, period, .keep_all=T) %>% mutate(period = factor(period, levels=c("PRE", "POST")))
+```
+
+### CV barplots
+```{r, fig.height=10, fig.width=5}
+tmp = ffreq2 %>% filter(!is.na(period)) %>%
+  filter(labels_con %in% labels_con_to_use)
+gg = ggplot(tmp, aes(rel_date, ff_cv, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~., scales="free_y")
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg
+nexpts = length(unique(tmp$labels))
+#save_plot(file.path(freq_dir, "ff_cv.pdf"), gg, base_width=6, base_height=nexpts, ncol=1, nrow=1)
+#ggsave(paste(plot_dir, "ff_cv.pdf", sep="/"), width=20, height=6)
+
+tmp = ffreq2 %>% filter(!is.na(period))  %>%
+  filter(labels_con %in% labels_con_to_use)
+gg = ggplot(tmp, aes(rel_date, ff_loess_cv, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~., scales="free_y")
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1))
+gg
+nexpts = length(unique(tmp$labels))
+#save_plot(file.path(freq_dir, "ff_loess_cv.pdf"), gg, base_width=6, base_height=nexpts, ncol=1, nrow=1)
+
+```
+
+```{r, fig.height=10, fig.width=5}
+tmp = ffreq2_group %>% ungroup()  %>%
+  filter(labels_con %in% labels_con_to_use)
+gg = ggplot(tmp, aes(rel_date, ff_cv_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~.)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + labs(x = "days relative to injection", y = "FF CV % change from baseline")
+gg = gg + geom_hline(yintercept=0, linetype=1)
+gg = gg + geom_vline(xintercept=0, linetype=2, color="grey")
+gg = gg + scale_fill_brewer("", palette="Dark2")
+gg = gg + scale_x_continuous(breaks=seq(-4, max(tmp$rel_date), 2))
+gg
+nexpts = length(unique(tmp$rel_date))
+nlabels = length(unique(tmp$labels))
+save_plot(file.path(freq_dir, "ff_cv_change.pdf"), gg, base_width=nexpts/2, base_height=2, ncol=1, nrow=nlabels)
+
+tmp = ffreq2_group %>% ungroup()  %>%
+  filter(labels_con %in% labels_con_to_use)
+gg = ggplot(tmp, aes(rel_date, ff_loess_cv_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~.)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + labs(x = "days relative to injection", y = "FF CV % change from baseline")
+gg = gg + geom_hline(yintercept=0, linetype=1)
+gg = gg + geom_vline(xintercept=0, linetype=2, color="grey")
+gg = gg + scale_fill_brewer("", palette="Dark2")
+gg = gg + scale_x_continuous(breaks=seq(-4, max(tmp$rel_date), 2))
+gg
+nexpts = length(unique(tmp$rel_date))
+nlabels = length(unique(tmp$labels))
+save_plot(file.path(freq_dir, "ff_loess_cv_change.pdf"), gg, base_width=nexpts/2, base_height=2, ncol=1, nrow=nlabels)
+
+
+```
+```{r}
+gg = ggplot(ffreq2_group, aes(duration_cv, ff_cv))
+gg = gg + geom_point(aes(color=as.factor(rel_date)))
+gg = gg + facet_wrap(~labels, scales="free")
+gg = gg + stat_smooth(method="lm")
+gg
+
+gg = ggplot(ffreq2_group, aes(duration_mean, ff_cv))
+gg = gg + geom_point(aes(color=rel_date))
+gg = gg + facet_wrap(~labels, scales="free")
+gg = gg + stat_smooth(method="lm")
+gg
+```
+
+```{r}
+ffreq2_group = ffreq2_group %>% group_by(labels) %>% do({
+  d = .
+  mod = lm(ff_cv~duration_cv, d)
+  res = residuals(mod)
+  data.frame(d, ff_cv_res = res)
+})
+```
+
+```{r, fig.height=10, fig.width=5}
+tmp = ffreq2_group %>% ungroup() #  %>%
+ #filter(!(rel_date %in% c(1)))
+gg = ggplot(tmp, aes(rel_date, ff_cv_res, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels~.)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + labs(x = "days relative to injection", y = "FF CV % change from baseline")
+gg = gg + geom_hline(yintercept=0, linetype=1)
+gg = gg + geom_vline(xintercept=0, linetype=2, color="grey")
+gg = gg + scale_fill_brewer("", palette="Dark2")
+gg = gg + scale_x_continuous(breaks=seq(-4, max(tmp$rel_date), 2))
+gg
+nexpts = length(unique(tmp$rel_date))
+nlabels = length(unique(tmp$labels))
+save_plot(file.path(freq_dir, "ff_cv_ff2_res.pdf"), gg, base_width=nexpts/2, base_height=2, ncol=1, nrow=nlabels)
+
+```
+
+## Directed song 
+```{r}
+ds_log = gs_title("directed song") %>% gs_read()  
+colnames(ds_log) = make.names(colnames(ds_log))
+ds_log = ds_log %>% mutate(ds_datetime_start = as.POSIXct(paste(date, time.start)),
+                           ds_datetime_end = as.POSIXct(paste(date, time.end)))
+```
+
+```{r}
+ffreq3_ds = ffreq3 %>% mutate(date = as.Date(date)) %>% 
+  inner_join(ds_log) %>%
+  mutate(period = if_else(parsed_time < ds_datetime_start, "PRE", "NONE"),
+         period = if_else(parsed_time >= ds_datetime_start & parsed_time <=ds_datetime_end, "DS", period),
+         period = if_else(parsed_time > ds_datetime_end, "POST", period))
+ffreq3_ds = ffreq3_ds %>%
+  group_by(labels, labels_con) %>% 
+  mutate(ff_z= zscore_my(ff, ff[period=="PRE"]))
+
+ffreq2_ds = ffreq3_ds %>% 
+  group_by(labels, labels_con, period) %>%
+  summarize_at(vars(ff, ff_loess, duration),
+               list(mean= "mean_na", cv = "calc_cv"))
+  #summarize(ff_mean = mean(ff, na.rm=T),
+  ##          ff_cv = sd(ff, na.rm=T) / ff_mean,
+  #          duration_mean = mean(duration),
+  #          duration_cv = calc_cv(duration))
+
+ffreq2_ds = ffreq2_ds %>% ungroup() %>% mutate(period = factor(period, levels=c("PRE", "DS", "POST")))
+
+ffreq2_ds_base = ffreq2_ds %>% filter(period=="PRE") %>% 
+  group_by(labels, labels_con) %>% 
+  summarize_at(vars(ff_mean, ff_cv, ff_loess_mean, ff_loess_cv, duration_mean, duration_cv), list("mean" = mean))
+  
+ffreq2_ds = ffreq2_ds %>% left_join(ffreq2_ds_base)
+ffreq2_ds_group = ffreq2_ds %>% 
+  group_by(labels, labels_con) %>%
+  mutate(ff_mean_change = perc_change(ff_mean, ff_mean_mean),
+         ff_cv_change = perc_change(ff_cv, ff_cv_mean),
+         ff_loess_mean_change = perc_change(ff_loess_mean, ff_loess_mean_mean),
+         ff_loess_cv_change = perc_change(ff_loess_cv, ff_loess_cv_mean),
+         duration_cv_change = perc_change(duration_cv, duration_cv_mean))
+
+ffreq2_ds_group = ffreq2_ds_group %>% left_join(info) %>%
+  distinct(labels, labels_con, period, .keep_all=T) %>% mutate(period = factor(period, levels=c("PRE", "DS", "POST")))
+```
+
+```{r}
+labels_con_to_use = c("cD", "dD", "aV")
+ffreq3_ds %>% select(labels_con, period) %>% table()
+ffreq3_ds %>% ungroup() %>% distinct(mat, period) %>% group_by(period) %>% summarize(n())
+```
+
+```{r}
+tmp = ffreq2_ds_group %>% ungroup() %>%
+  filter(labels_con %in% labels_con_to_use)
+ #filter(!(rel_date %in% c(1)))
+gg = ggplot(tmp, aes(period, ff_cv_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~.)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + labs(x = "days relative to injection", y = "FF CV % change from baseline")
+gg = gg + geom_hline(yintercept=0, linetype=1)
+gg = gg + geom_vline(xintercept=0, linetype=2, color="grey")
+gg = gg + scale_fill_brewer("", palette="Dark2")
+#gg = gg + scale_x_continuous(breaks=seq(-4, max(tmp$rel_date), 2))
+gg
+nexpts = length(unique(tmp$period))
+nlabels = length(unique(tmp$labels))
+save_plot(file.path(freq_dir, "ff_cv_change_ds.pdf"), gg, base_width=nexpts/2, base_height=2, ncol=1, nrow=nlabels)
+
+tmp = ffreq2_ds_group %>% ungroup() %>%
+  filter(labels_con %in% labels_con_to_use)
+ #filter(!(rel_date %in% c(1)))
+gg = ggplot(tmp, aes(period, ff_mean_change, fill=period)) 
+gg = gg + geom_bar(position=position_dodge(), stat="identity")
+gg = gg + facet_grid(labels_con~.)
+gg = gg + theme_classic()
+gg = gg + theme(axis.text.x=element_text(angle=45, hjust=1),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg = gg + labs(x = "days relative to injection", y = "FF mean % change from baseline")
+gg = gg + geom_hline(yintercept=0, linetype=1)
+gg = gg + geom_vline(xintercept=0, linetype=2, color="grey")
+gg = gg + scale_fill_brewer("", palette="Dark2")
+#gg = gg + scale_x_continuous(breaks=seq(-4, max(tmp$rel_date), 2))
+gg
+nexpts = length(unique(tmp$period))
+nlabels = length(unique(tmp$labels))
+save_plot(file.path(freq_dir, "ff_mean_change_ds.pdf"), gg, base_width=nexpts/2, base_height=2, ncol=1, nrow=nlabels)
+```
+```{r}
+ffreq2_ds_group %>% filter(period=="DS") %>% select(labels, ff_cv_change)
+```
+
+
+## FF density
+```{r}
+suffix = "ff3"
+tmp = ffreq3 %>% filter(rel_date>=-2, rel_date<=8)
+tmp_n = tmp %>% group_by(bird, labels, rel_date) %>% summarize(n=n())
+tmp = tmp %>% left_join(tmp_n) %>%
+  filter(n>50)
+days = unique(tmp$rel_date)
+npre_days = sum(days<=0)
+npost_days = sum(days>0)
+
+#colors = c(rep("grey", times=npre_days), rev(viridis_pal()(npost_days)))
+colors = c(rep("grey", times=npre_days), colorRampPalette(c("green", "darkgreen"))(npost_days))
+names(colors) = days
+gg = ggplot(tmp, aes(ff_z, color=as.factor(rel_date)))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(bird~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+ncols = length(unique(ffreq3$labels))
+save_plot(file.path(freq_dir, sprintf("ff_z_density_by_day_%s.pdf", suffix)), gg, base_height=3, base_aspect_ratio = 1.3, ncol=ncols, nrow=1)
+
+gg = ggplot(tmp, aes(ff, color=as.factor(rel_date)))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(bird~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+ncols = length(unique(ffreq3$labels))
+save_plot(file.path(freq_dir, sprintf("ff_density_by_day_%s.pdf", suffix)), gg, base_height=3, base_aspect_ratio = 1.3, ncol=ncols, nrow=1)
+
+gg = ggplot(tmp, aes(ff, color=as.factor(rel_date)))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(rel_date~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+ncols = length(unique(ffreq3$labels)) + 1
+nrows = length(days)
+save_plot(file.path(freq_dir, sprintf("ff_density_by_day_split_%s.pdf", suffix)), gg, base_height=1.5, base_aspect_ratio = 1.1, ncol=ncols, nrow=nrows)
+
+tmp1 = tmp %>% 
+  #filter(rel_date %in% c(-2, -1, 3, 4,5, 6)) %>%
+  mutate(period = factor(period, levels=c("PRE", "POST"), labels=c("pre-injection", "post-injection"))) %>%
+  group_by(period, labels) %>%
+  mutate(ff_zero = ff - mean(ff))
+
+gg = ggplot(tmp1, aes(ff, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(.~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz)")
+gg
+
+ncols = length(unique(ffreq3$labels)) + 1
+nrows = 1
+save_plot(file.path(freq_dir, sprintf("ff_density_by_period_%s.pdf", suffix)), gg, base_height=1.5, base_aspect_ratio = 1.1, ncol=ncols, nrow=nrows)
+
+gg = ggplot(tmp1, aes(ff_z, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(.~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz), Z-scored")
+gg
+ncols = length(unique(ffreq3$labels)) + 1
+nrows = 1
+save_plot(file.path(freq_dir, sprintf("ff_z_density_by_period_%s.pdf", suffix)), gg, base_height=1.5, base_aspect_ratio = 1.1, ncol=ncols, nrow=nrows)
+
+
+gg = ggplot(tmp1, aes(ff_zero, color=period))
+gg = gg + geom_density()
+gg= gg + scale_color_manual("", values=c("grey40", "darkgreen"))
+gg = gg + facet_grid(.~labels, scales="free_x")
+gg = gg + labs(x="FF (kHz), mean-subtracted")
+gg
+ncols = length(unique(ffreq3$labels)) + 1
+nrows = 1
+save_plot(file.path(freq_dir, sprintf("ff_zero_density_by_period.pdf", suffix)), gg, base_height=1.5, base_aspect_ratio = 1.1, ncol=ncols, nrow=nrows)
+
+
+
+
+```
+```{r}
+#colors = c(rep("grey", times=npre_days), rev(viridis_pal()(npost_days)))
+colors = c(rep("grey", times=npre_days), colorRampPalette(c("green", "darkgreen"))(npost_days))
+names(colors) = days
+gg = ggplot(tmp, aes(ff_z, y=rel_date, fill=as.factor(rel_date)))
+gg = gg + geom_density_ridges(size=.25, scale=10)
+gg = gg + scale_y_reverse()
+gg= gg + scale_fill_manual("day relative to injection", values=colors)
+gg = gg + facet_grid(.~labels, scales="free_x")
+gg = gg + labs(x="FF (Z-score)", y="")
+gg = gg + theme(axis.text.y=element_blank(), axis.line.y=element_blank(), axis.ticks.y=element_blank())
+gg
+save_plot(file.path(freq_dir, sprintf("ff_z_density_by_date_ridge.pdf", suffix)), gg, base_height=3, base_aspect_ratio = 1.1, ncol=ncols, nrow=1)
+```
+
+
+```{r}
+# tmp = ffreq2_group %>% ungroup() %>% 
+#   filter(date > "2018-03-03", date < "2018-03-22") %>%
+#   filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+#   filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+#   mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+#   arrange(expt_group) %>%
+#   mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+#   filter(!is.na(expt)) %>%
+#   filter(period != "PRE")
+# gg = ggplot(tmp, aes(expt_group, ff_cv_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_point(position = position_jitter(width=.2))
+# gg = gg + facet_grid(labels~period, scales="free_y")
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + labs(x = "", y = "FF CV, % change from baseline")
+# gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+#                 strip.text.y=element_text(angle=0),
+#                 legend.position="none")
+# gg
+# save_plot(file.path(plot_dir, "ff_cv_change_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+# save_plot(file.path(plot_dir, "ff_cv_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+```
+
+T-test
+```{r}
+# tmp_t = tmp %>% group_by(period, labels) %>% do(ttest_res = t.test(.$ff_cv_change[.$expt_group=="PBS"], .$ff_cv_change[.$expt_group=="CRH"])) %>% tidy(ttest_res)
+# tmp_t
+```
+
+```{r}
+# tmp = ffreq2_group %>% ungroup() %>% 
+#   filter(date > "2018-03-03", date < "2018-03-22") %>%
+#     filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+#   filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+#   mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+#   arrange(expt_group) %>%
+#   mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+#   filter(!is.na(expt)) %>%
+#   filter(period != "PRE")
+# gg = ggplot(tmp, aes(expt_group, ff_mean_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_point(position = position_jitter(width=.2))
+# gg = gg + facet_grid(labels~period, scales="free_y")
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + labs(x = "", y = "FF, % change from baseline")
+# gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+#                 strip.text.y=element_text(angle=0),
+#                 legend.position="none")
+# gg
+# save_plot(file.path(plot_dir, "ff_mean_change_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+# save_plot(file.path(plot_dir, "ff_mean_change_expt_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+```
+
+T-test
+```{r}
+# tmp_t = tmp %>% group_by(period, labels) %>% do(ttest_res = t.test(.$ff_mean_change[.$expt_group=="PBS"], .$ff_mean_change[.$expt_group=="CRH"])) %>% tidy(ttest_res)
+# tmp_t
+```
+
+```{r}
+# tmp = ffreq2_group %>% ungroup() %>%
+#  filter(date > "2018-03-03", date < "2018-03-22") %>%
+#   filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+#     filter(!(expt %in% c("PBS-control (6)"))) %>% # Recording error in morning
+#   mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+#   arrange(expt_group) %>%
+#   mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+#   filter(!is.na(expt)) %>%
+#   filter(period != "PRE")
+# gg = ggplot(tmp, aes(ff_mean_change, ff_cv_change, color=expt_group))
+# gg = gg + geom_hline(yintercept=0, linetype=2)
+# gg = gg + geom_vline(xintercept=0, linetype=2)
+# gg = gg + geom_point()
+# gg = gg + scale_color_manual("", values=colors)
+# gg = gg + facet_grid(labels~period)
+# gg = gg + labs(x="FF % change", y="FF CV % change")
+# gg
+# fname = "ff_mean_change_vs_ff_cv_change.pdf"
+# save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5)
+# save_plot(file.path(plot_dir, fname), gg, ncol = 1, nrow=1, base_height = 5, base_aspect_ratio = 1.3)
+```
+
+
+```{r}
+# gg = ggplot(ungroup(ffreq3), aes(ff_z, color=period))
+# gg = gg + geom_density()
+# gg = gg + facet_grid(expt~labels)
+# gg
+```
+
+## Rolling CV
+```{r}
+ffreq_cv = ffreq3 %>% group_by(labels, rel_date) %>% arrange(mtime_onsets) %>% do({
+  d = .
+  res = calc_rolling_func(d$ff, 5, func=calc_cv, direction = "backward"  )
+  res11 = calc_rolling_func(d$ff, 11, func=calc_cv, direction = "backward" )
+  res51 = calc_rolling_func(d$ff, 51, func=calc_cv, direction = "backward" )
+  data.frame(., ff_cv=res, ff_cv11 = res11, ff_cv51 = res51)
+})
+
+vars_cur = vars(ff_cv, ff_cv11, ff_cv51)
+ffreq_cv = ffreq_cv %>% group_by(labels) %>% 
+  mutate(baseline = period =="PRE") %>%
+  do({
+    d = .
+    d  %>% mutate_at(vars_cur, list(z = "zscore_my", perc="perc_change"), baseline=d$baseline)
+    
+  })
+```
+## Within bout CV
+```{r}
+ffreq_cv_bout = ffreq3 %>% group_by(labels, wav, period) %>% arrange(mtime_onsets) %>% 
+  summarize(ff_cv = calc_cv(ff))
+ffreq_cv_bout = ffreq_cv_bout %>% group_by(labels) %>% 
+  mutate(ff_cv_z = zscore_my(ff_cv, ff_cv[period=="PRE"]),
+         ff_cv_perc = 100 * (ff_cv - mean(ff_cv[period=="PRE"])) / mean(ff_cv[period=="PRE"]))
+
+ffreq_cv_bout = ffreq_cv_bout %>%
+  left_join(info) %>%
+  ungroup() #%>% mutate(expt = factor(expt, levels=drug_date$expt)) %>% group_by(expt)
+```
+
+## Across time 
+```{r}
+ff_labels = unique(ffreq3$labels)
+```
+
+```{r message=FALSE, warning=FALSE}
+value = c("ff_z")
+ffreq3_sub = ffreq3 %>% sample_frac(.2)
+walk(ff_labels, function(label) {
+  tmp = ffreq3_sub %>% filter(labels==label) %>%
+    #filter(date > "2018-03-03", date < "2018-03-22") %>%
+    filter(ff > freq_lower, ff < freq_upper)# %>% 
+    #mutate(on_drug = (log.drug!="PBS")) %>%
+    #filter(!(expt %in% expt_to_exclude)) %>%
+    #filter(!grepl("cannulae|probe", expt)) %>%
+    #filter(!is.na(period))
+  gg = plot_across_time_current(tmp, value)
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt, scales="free_x")
+  
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label, y= "FF (Z-score)")
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + ylim(-5, 5)
+  print(gg)
+  ggsave(paste(freq_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+
+value = c("ff")
+walk(ff_labels, function(label) {
+  #tmp = ffreq3 %>% filter(labels==label) %>%
+    #filter(date > "2018-03-03", date < "2018-03-22") %>%
+  #  filter(ff > freq_lower, ff < freq_upper) #%>% 
+    #mutate(on_drug = (log.drug!="PBS")) %>%
+    #filter(!(expt %in% expt_to_exclude)) %>%
+    ##filter(!grepl("cannulae|probe", expt)) %>%
+    #filter(!is.na(period))
+  gg = plot_across_time_current(ffreq3_sub %>% filter(labels==label), value)
+  
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label, y= "FF (kHz)")
+  print(gg)
+  ggsave(paste(freq_dir, sprintf("%s_%s_time.pdf", value, label),sep="/"), width=fig_width, height=fig_height )
+})
+#})
+```
+
+
+```{r}
+# value = c("ff")
+# walk(ff_labels, function(label) {
+#   tmp = ffreq3 %>% group_by(expt) %>% filter(labels==label)
+#   total_days = as.numeric(max(tmp$date) - min(tmp$date))
+#   gg = ggplot(tmp, aes_string("mtime", value))
+#   gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+#   gg = gg + scale_color_manual(values=colors)
+#   gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+#   gg = gg + labs(title=label, y="FF (kHz)")
+#   gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+#   print(gg)
+#   save_plot(paste(across_days, sprintf("%s_%s_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days, limitsize=F)
+#   
+#   gg = ggplot(tmp, aes_string("mtime", value))
+#   gg = gg + geom_point(aes(color=log.drug), alpha=.01)
+#   gg = gg + scale_color_manual(values=colors)
+#   gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+#   gg = gg + labs(title=label, y="FF (kHz)")
+#   gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+#   print(gg)
+#   save_plot(paste(across_days, sprintf("%s_%s_span1_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days,  limitsize=F)
+#  # ggsave(paste(across_days, sprintf("%s_%s_days.pdf", value, label),sep="/"), width=total_days, height=4 )
+#   
+#   gg = ggplot(tmp %>% ungroup(), aes_string("mtime", value))
+#   gg = gg + geom_point(aes(color=log.drug), alpha=.01)
+#   #gg = plot_across_days(ffreq3 %>% filter(labels==label), value)
+#   gg = gg + scale_color_manual(values=colors)
+#   #gg = gg + facet_wrap(~expt, scales="free_x")
+#   gg = gg + stat_smooth(se=F, fullrange=F, span=.1, method="loess")
+#   gg = gg + labs(title=label, y="FF (kHz)")
+#   gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+#   print(gg)
+#   save_plot(paste(across_days, sprintf("%s_%s_span10_all_days.pdf", value, label),sep="/"), gg, base_width = .5, base_height = 4, ncol=total_days,  limitsize=F)
+# })
+```
+
+```{r}
+# value = c("ff")
+# walk(ff_labels, function(label) {
+#   tmp = ffreq3 %>% filter(labels==label) %>% 
+#     group_by(labels_con, expt) %>% filter(n()>500)
+#   gg = ggplot(tmp, aes_string("mtime", value))
+#   gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+#   gg = gg + scale_color_manual(values=colors)
+#   gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+#   gg = gg + labs(title=label)
+#   gg = gg + facet_grid(labels_con~.)
+#   gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+#   print(gg)
+#   ggsave(paste(across_days, sprintf("%s_%s_pre_days.pdf", value, label),sep="/"), width=20, height=10 )
+# })
+```
+
+
+
+### FF CV
+```{r}
+values = c("ff_cv_z", "ff_cv11_z")
+ffreq_cv_sub = ffreq_cv %>% sample_frac(.2)
+walk(values, function(value) {
+walk(ff_labels, function(label) {
+  tmp = ffreq_cv_sub %>% filter(labels==label)
+
+  gg = plot_across_time_current(tmp, value)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + ylim(-8, 8)
+  
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV (Z-score)")
+  print(gg)
+  ndays = length(unique(tmp$rel_date))
+  save_plot(file.path(freq_dir, sprintf("%s_%s_time.pdf", value, label)), gg, base_width=.75, base_height=3, ncol=ndays, nrow=1)
+  
+})
+})
+
+values = c("ff_cv_perc", "ff_cv11_perc", "ff_cv51_perc")
+ffreq_cv_sub = ffreq_cv %>% sample_frac(.2)
+walk(values, function(value) {
+walk(ff_labels, function(label) {
+  tmp = ffreq_cv_sub %>% filter(labels==label)
+
+  gg = plot_across_time_current(tmp, value)
+  gg = gg + scale_color_manual(values=colors)
+  gg = gg + ylim(-100, 100)
+  
+  gg = gg + geom_hline(yintercept=0, linetype=2)
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV (% of baseline)", x="days post-injection")
+  gg = gg + scale_x_continuous(breaks=c(-2, 0, 2, 4, 6))
+  print(gg)
+  ndays = length(unique(tmp$rel_date))
+  save_plot(file.path(freq_dir, sprintf("%s_%s_time.pdf", value, label)), gg, base_width=.75, base_height=3, ncol=ndays, nrow=1)
+  
+})
+})
+
+values = c("ff_cv", "ff_cv11")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv_sub %>% filter(labels==label)
+    gg = plot_across_time_current(tmp, value)
+    gg = gg + scale_color_manual(values=colors)
+    #gg = gg + ylim(-5, 5)
+    #gg = gg + ylim(0, .03)
+    #gg = gg + geom_hline(yintercept=0, linetype=2)
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV")
+    print(gg)
+    ndays = length(unique(tmp$rel_date))
+  save_plot(file.path(freq_dir, sprintf("%s_%s_time.pdf", value, label)), gg, base_width=.75, base_height=3, ncol=ndays, nrow=1)
+  })
+})
+```
+
+```{r}
+values = c("ff_cv")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv_bout %>% filter(labels==label, expt %in% filts)
+    n_expts = length(unique(as.character(tmp$expt)))
+  ncolumns = 5
+  nrows = ceiling(n_expts / ncolumns)
+    gg = plot_across_time_current(tmp, value)
+    gg = gg + scale_color_manual(values=colors)
+    gg = gg + facet_wrap(~expt)
+    gg = gg + ylim(0, .06)
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=sprintf("%s - %s", value, label), y = "FF CV")
+    print(gg)
+     save_plot(file.path(freq_dir, sprintf("%s_%s_bout_time.pdf", value, label)), gg, base_width=2, base_height=2, ncol=ncolumns, nrow=nrows)
+  })
+})
+
+values = c("ff_cv", "ff_cv11")
+walk(values, function(value) {
+walk(ff_labels, function(label) {
+  tmp = ffreq_cv %>% group_by(expt) %>% filter(labels==label) %>%
+    filter(expt %in% filts)
+  total_days = as.numeric(max(tmp$date) - min(tmp$date))
+  gg = ggplot(tmp , aes_string("mtime_onsets", value))
+  gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+  #gg = plot_across_days(ffreq3 %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+  gg = gg + labs(title=label, y="FF CV", x ="")
+  gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+  gg = gg + ylim(0, .06)
+  print(gg)
+  save_plot(paste(freq_dir, sprintf("%s_%s_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days, limitsize=F)
+  
+  gg = ggplot(tmp , aes_string("mtime_onsets", value))
+  gg = gg + geom_point(aes(color=log.drug), alpha=.01)
+  #gg = plot_across_days(ffreq3 %>% filter(labels==label), value)
+  gg = gg + scale_color_manual(values=colors)
+  #gg = gg + facet_wrap(~expt, scales="free_x")
+  gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+  gg = gg + labs(title=label, y="FF CV", x ="")
+  gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+  gg = gg + ylim(0, .06)
+  gg = gg + theme(panel.grid.major.y = element_line(color="grey"))
+  print(gg)
+  save_plot(paste(freq_dir, sprintf("%s_%s_span1_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days, limitsize=F)
+ # ggsave(paste(across_days, sprintf("%s_%s_days.pdf", value, label),sep="/"), width=20, height=4 )
+})
+})
+
+values = c("ff_cv")
+walk(values, function(value) {
+  walk(ff_labels, function(label) {
+    tmp = ffreq_cv_bout %>% group_by(expt) %>% filter(labels==label) %>%
+      filter(expt %in% filts)
+    total_days = as.numeric(max(tmp$date) - min(tmp$date))
+    gg = ggplot(tmp , aes_string("mtime", value))
+    gg = gg + geom_point(aes(color=log.drug), alpha=.1)
+    #gg = plot_across_days(ffreq3 %>% filter(labels==label), value)
+    gg = gg + scale_color_manual(values=colors)
+    #gg = gg + facet_wrap(~expt, scales="free_x")
+    gg = gg + stat_smooth(se=F, fullrange=F, span=.5, method="loess")
+    gg = gg + labs(title=label, y="FF within bout CV", x ="")
+    gg = gg + guides(color = guide_legend(override.aes=list(alpha=1)))
+    gg = gg + ylim(0, .06)
+    print(gg)
+    save_plot(paste(freq_dir, sprintf("%s_%s_bout_days.pdf", value, label),sep="/"), gg, base_width = 1.5, base_height = 4, ncol=total_days, limitsize=F)
+  })
+})
+
+```
+
+## Grouped data
+```{r}
+ggp = geom_point(alpha=.01, position=position_jitter(width=.2))
+gf =  facet_wrap(~labels)
+gth = theme_bw()
+gli =  ylim(-4, 4)
+ghl = geom_hline(yintercept=0, linetype=2)
+gxl = xlab("")
+```
+
+```{r}
+gg = ggplot(ffreq3, aes_string("period", "ff_z", color="period"))
+gg = gg + ggp + gf + gth + gli + ghl + gxl
+gg = gg + facet_grid(expt~labels)
+gg
+ggsave(paste(plot_dir, sprintf("%s_group.pdf", "ff_z"), sep="/"), width=8, height=8)
+```
+
+# PSDs
+```{r}
+#label = "d"
+
+redo = T
+drop = T
+wl = 512
+fs = 44100
+window = wl / fs
+
+#psds = lapply(1:nrow(params), function(k) {
+#  params_cur = params[k,]
+#  label = params_cur$label
+#  lbuffer = params_cur$lbuffer
+#  rbuffer = params_cur$rbuffer
+#print(label)
+ fname = paste(prefix_data, bird, "psds.rds", sep="/")
+ tname = "psds"
+if (redo) {
+  if (drop && db_has_table(db$con, tname))
+    db_drop_table(db$con, tname)
+  psds1 = calc_psds_batch2(info, wl=wl, data_db=db,tname=tname, return_df=T, params=params)
+  saveRDS(psds1, fname)
+} else {
+  psds1 = readRDS(fname)
+}
+```
+
+```{r}
+#mats = collect(tbl(db, "mats"), n=Inf)
+audio_input = "wav"
+mats = load_mat_batch(info1, 
+                      #data_db=db,
+                      #tname=tname,
+                      replace_data=F,
+                      #index_cols=c("labels", "mat"),
+                      #addl_filters=list(c("labels", label)),
+                      parallel=F,
+                      audio_input=audio_input)
+psds2 = psds1 %>% left_join(mats, by="id") %>%
+  left_join(info, by="mat")
+```
+
+```{r}
+# psds1 = psds1 %>% mutate(psd_mean = map(psd, ~apply(.x, 1, mean)))
+# psds1 = psds1 %>% mutate(psd_norm = map(psd, ~apply(.x, 2, function(x)  (x - min(x))/ (max(x)-min(x)))))
+# psds1 = psds1 %>% mutate(psd_norm_went = map(psd_norm, ~apply(.x, 2, function(x) log2(calc_wiener_entropy_psd(data.frame(0,x), band = c(1,10))))))
+# psds1 = psds1 %>% mutate(psd_norm_went_mean = map_dbl(psd_norm_went, mean))
+# psds1 = psds1 %>% left_join(info)
+```
+
+```{r}
+psds2 = psds2 %>% group_by(id) %>% mutate(psd_norm = scale_01(log(power)))
+```
+
+```{r}
+library(NMF)
+#anno = ungroup(psds2) %>% mutate(time = as.numeric(mtime)) %>% select(time)
+par(mfrow=c(1,1))
+br = seq(0, 1, .05)
+br = c(0, seq(.6, 1, .01))
+tmp = psds2 %>% filter(freq<8)
+for (l in unique(psds2$labels)) {
+psds2_s = acast(tmp %>% filter(labels==l), freq~id, value.var = "psd_norm")
+aheatmap(psds2_s[nrow(psds2_s):1,], Colv=NA, Rowv=NA, revC=T, breaks=br, color = sprintf("Blues:%s", length(br)+1))
+}
+```
+
+```{r}
+plot_psd_across_id = function(data, x_value="id", y_value="freq", fill_value="psd_norm", facet_factor="expt") {
+  gg = ggplot(data, aes_string(x_value, y_value, fill = fill_value))
+  gg = gg + geom_raster(interpolate = T)
+  
+  ## Added shaded sections -------------------------------------------------
+  data_un = data %>% distinct(drug_start, drug_stop, .keep_all=T) %>%
+    filter(!is.na(drug_start))
+  gg = gg + geom_rect(data = data_un,
+                      aes(xmin=id_drug_start,
+                          xmax=id_drug_stop),
+                      ymin = -Inf,
+                      ymax = Inf,
+                      fill=NA,
+                      color="grey",
+                      alpha=.5)
+  ## Split by facet_factor ------------------------------------------------------------
+  gg = gg + facet_wrap(as.formula(paste("~", facet_factor, sep="")), scales="free")
+  gg = gg + scale_fill_gradient(low = "white", high="darkblue", limits=c(.4, 1) )
+  gg = gg + ylim(0,8)
+  gg = gg + theme_bw()
+  gg = gg + theme(axis.text.x = element_text(angle=45, hjust=1),
+                  panel.grid.major.x=element_line(linetype=3, color="grey"))
+  gg
+}
+```
+
+```{r}
+expts = c("PBS-control (1)", "10 uM CRH", "10 uM CRH(6-33)", "4 mM AP5", "10 uM CRH/10 uM CRH(6-33)")
+data = psds2 %>% filter(expt %in% expts )
+
+ids = psds2 %>% distinct(id, labels, expt) %>%
+  group_by(labels, expt) %>%
+  mutate(rel_id = 1:length(id))
+data = data %>% left_join(ids)
+data = data %>% group_by(expt) %>% mutate(id_drug_start = rel_id[rel_mtime>=rel_drug_start][1],
+                                          id_drug_stop = rel_id[rel_mtime>=rel_drug_stop][1])
+
+data_ff = ffreq1 %>% left_join(ids)
+data_ff = data_ff %>% group_by(expt) %>% mutate(id_drug_start = rel_id[rel_mtime>=rel_drug_start][1],
+                                          id_drug_stop = rel_id[rel_mtime>=rel_drug_stop][1])
+
+x_value = "rel_id"
+y_value = "freq"
+fill_value = "psd_norm"
+facet_factor = "expt"
+
+labels = unique(data$labels)
+
+for (l in labels) {
+  print(l)
+  tmp = data %>% filter(labels==l)
+  tmp = tmp %>% filter(rel_id > (id_drug_start) - 100,
+                       rel_id < (id_drug_stop) + 100)
+  gg = plot_psd_across_id(tmp, x_value=x_value, y_value=y_value, fill_value=fill_value,
+                     facet_factor=facet_factor)
+  gg = gg + labs(title=l)
+  gg = gg + ylim(2, 5)
+  
+  tmp_ff = data_ff %>% 
+    filter(labels==l) %>% 
+    filter(expt %in% expts) %>% 
+    filter(rel_id > (id_drug_start) - 100,
+           rel_id < (id_drug_stop) + 100) %>%
+    mutate(psd_norm = 1)
+  gg = gg + geom_line(data=tmp_ff, aes_string(x_value, "ff"), color="red")
+  print(gg)
+}
+```
+
+```{r}
+gg = ggplot(psds1 %>% filter(labels=="d"), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_xwent_mean, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="r") %>%
+              filter(grepl("CRH", expt)), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_went_z, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8) + ylim(-6,6)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+
+
+
+
+# Durations
+```{r}
+syls1 = syls1 %>% mutate(dur = offsets - onsets)
+syls1 = syls1 %>% group_by(mat) %>% do({
+  peaks = . 
+  gap_durations = vector("numeric", length = nrow(peaks) - 1)
+  for (i in 1:(length(gap_durations)-1)) {
+    gap_durations[i] = peaks[i+1,1] - peaks[i,2]
+  }
+  data.frame(peaks, gap_dur=c(NA, unlist(gap_durations)))
+})
+syls1 = syls1 %>% mutate(gap_dur = ifelse(gap_dur>.200, NA, gap_dur))
+```
+
+```{r}
+syls1 = syls1 %>% group_by(expt, labels) %>% 
+  mutate(dur_z = zscore_my(dur, dur[period=="PRE"]),
+         gap_dur_z = zscore_my(gap_dur, gap_dur[period=="PRE"]))
+```
+
+```{r}
+# value = c("went_mean_log2_res_z1")
+# value= "dur_z"
+# colors = c("PBS"="black",
+#            "CRH"="red",
+#            "AP5"="darkorange",
+#            "PBS-test"="blue",
+#            "none"="black")
+# gg = plot_across_time_current(syls1 %>% filter(labels=="a"), value)
+# gg = gg + scale_color_manual(values=colors)
+# gg = gg + facet_wrap(~expt, scales="free_x")
+# gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+# gg
+```
+
+```{r}
+gg = ggplot(ungroup(syls1), aes(dur, color=period))
+gg = gg + geom_density()
+gg = gg + facet_grid(.~labels)
+gg 
+ggsave(paste(plot_dir, "durations.pdf", sep="/"), width=12, height=10)
+```
+```{r}
+gg = ggplot(ungroup(syls1), aes(gap_dur, color=period))
+gg = gg + geom_density()
+gg = gg + facet_grid(expt~labels, scales="free_x")
+#gg = gg + 
+gg 
+ggsave(paste(plot_dir, "gap_durations.pdf", sep="/"), width=12, height=10)
+```
+
+
+```{r}
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("PBS-test (1)", "5 uM CRH", "10 uM CRH(6-33)")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(expt~period)
+gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+```
+
+```{r}
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("5 uM CRH"), labels %in% c("a", "b", "c", "d", "e", "f", "g", "w", "r", "x")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(labels~period, scales="free_y")
+gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+ggsave(paste(plot_dir, "freq-mean_dur_5umCRH.pdf", sep="/"), width=12, height=10)
+
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("5 uM CRH"), labels %in% c("a", "b", "c", "d", "e", "f", "g", "w", "r", "x")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(period~labels, scales="free_y")
+gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+ggsave(paste(plot_dir, "freq-mean_dur_2_5umCRH.pdf", sep="/"), width=16, height=8)
+```
+
+```{r}
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("10 uM CRH(6-33)"), labels %in% c("a", "b", "c", "d", "e", "f", "g", "w", "r", "x")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(labels~period, scales="free")
+gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+ggsave(paste(plot_dir, "freq-mean_dur_10umCRH(6-33).pdf", sep="/"), width=12, height=10)
+
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("10 uM CRH(6-33)"), labels %in% c("a", "b", "c", "d", "e", "f", "g", "w", "r", "x")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(period~labels, scales="free")
+gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+ggsave(paste(plot_dir, "freq-mean_dur_2_5umCRH(6-33).pdf", sep="/"), width=16, height=8)
+```
+
+
+```{r}
+gg = ggplot(ungroup(syls1) %>% filter(expt %in% c("5 uM CRH (2)", "PBS-control (2)"), labels %in% c("e")), aes(dur, freq_mean, color=labels)) 
+gg = gg + geom_point(alpha=.1)
+gg = gg + facet_grid(expt~period, scales="free_y")
+#gg = gg + xlim(0, .15)
+gg = gg + theme_bw()
+gg = gg + gu
+gg
+```
+
+
+# Song rates
+```{r}
+# dates_to_proc_full = list(c("2017-07-21", "songs"),
+#                           c("2017-07-25", "songs"),
+#                           c("2017-07-26", "songs"),
+#                           c("2017-07-27", "songs"),
+#                           c("2017-07-28", "songs"),
+#                           c("2017-07-29", "songs"))
+
+# files = map(dates_to_proc_full, ~list.files(paste("/mnt/bengal_home/song", bird, .x[1], .x[2], sep="/"), pattern="wav$", full.names = F)) %>% unlist()
+# info_full = data.frame(wav_base=files, mtime = parse_timestamp(files)) %>% mutate(date = floor_date(mtime, "day"),
+#                                                                                   date = as.character(date))
+```
+
+```{r}
+# drug_date = data.frame(date = as.POSIXct(map_chr(dates_to_proc, 1)),
+#                        expt = c("PBS-1", "PBS-2", "PBS-3", "1 uM CRH", "5 uM CRH", "5 uM CRH", "5 uM CRH", 
+#                                 "5 uM CRH", "2 uM CRH", "3 uM CRH", "PBS-test"))
+# drug_date = data.frame(date = map_chr(dates_to_proc, 1),
+#                        expt = c(
+#                                 "4 mM AP5",
+#                                 "5 uM CRH",
+#                                 "PBS-test (1)",
+#                                 "10 uM CRH(6-33)",
+#                                 "10 uM CRH/10 uM CRH(6-33)",
+#                                 "PBS-control (1)")) %>% 
+#   mutate(date = as.character(date))
+# info_full = info_full %>% left_join(drug_date)
+# info_full = info_full %>% left_join(info %>% mutate(date=as.character(date)) %>% select(-mtime), by=c("date", "expt")) %>% distinct(wav_base, .keep_all=T)
+
+#info_full = info_full %>% left_join(drug_times)
+# info_full = info_full %>% group_by(expt) %>%
+#   mutate(period = if_else(log.drug!=solvent,
+#                           "DRUG",
+#                           if_else(mtime < drug_start, "PRE", "POST"))) %>%
+#   mutate(period = factor(period, levels=period_levels))
+# 
+# info_full = info_full %>% group_by(expt) %>%
+#     mutate(rel_mtime = as.numeric(difftime(mtime, drug_start, units="hours")),
+#          rel_drug_start = 0,
+#          rel_drug_stop = as.numeric(difftime(drug_stop, drug_start, units="hours")))
+
+```
+
+```{r}
+# solvent = "PBS"
+# a = info_full %>% group_by(expt) %>% do({
+#   d = .
+#   d1 = d %>% distinct(drug_time, .keep_all=T) %>% select(expt, log.drug_conc, drug_time, date)
+#   if (nrow(d1)==1) {
+#     d3 = data.frame(expt=d1$expt,
+#                     drug_start = as.POSIXct(paste(d1$date, "10:00:00 PST", sep=" ")),
+#                     drug_stop = as.POSIXct(paste(d1$date, "14:00:00 PST", sep=" ")))
+#     return(d3)
+#   } else {
+#     d3 = list()
+#     for (i in 1:nrow(d1)) {
+#       if (d1$log.drug_conc[i] != solvent) {
+#         d3 = c(d3, list(data.frame(expt = d1$expt[i],
+#                                    drug_start = d1$drug_time[i],
+#                                    drug_stop = d1$drug_time[i+1])))
+#       }
+#     }
+#     return(d3 %>% bind_rows())
+#   }
+# })
+# info_full = info_full %>% left_join(a)
+```
+
+```{r}
+res = 1
+info = info %>% 
+  mutate(datetime_hour = cut(mtime,
+                             breaks=seq(min(floor_date(mtime, "hour")),
+                                        max(ceiling_date(mtime, "hour")), 3600)),
+         datetime_ten_min = cut(mtime, 
+                                breaks=seq(min(floor_date(mtime, "hour")),
+                                           max(ceiling_date(mtime, "hour")), 600)),
+         rel_mtime_cut = cut(rel_mtime, breaks = seq(floor(res*min(rel_mtime))/res,
+                                                     ceil(res*max(rel_mtime))/res,
+                                                     1/res)))
+info_full = info_full %>% mutate(rel_mtime_cut = map(str_split(rel_mtime_cut, ","), 2) %>% map_dbl(~as.numeric(gsub("]", "", .x))))
+```
+
+```{r}
+info_full = info %>% distinct(wav_base, .keep_all=T)
+info_full1 = info_full %>% group_by(expt, datetime_ten_min) %>% summarize(nsongs = n()) %>%
+  mutate(datetime_ten_min = as.POSIXct(datetime_ten_min)) %>% ungroup()
+info_full2 = info_full %>% group_by(expt, datetime_hour) %>% summarize(nsongs = n()) %>%
+  mutate(datetime_hour = as.POSIXct(datetime_hour)) %>% ungroup()
+info_full3 = info_full %>% group_by(expt, rel_mtime_cut, rel_drug_start, rel_drug_stop) %>% summarize(nsongs = n())
+```
+
+
+```{r}
+gg = ggplot(info_full1, aes(datetime_ten_min, nsongs)) + geom_point()
+gg = gg + facet_wrap(~expt)
+gg
+```
+
+
+```{r}
+gg = ggplot(info_full2, aes(datetime_hour, nsongs)) + geom_point()
+gg = gg + facet_wrap(~expt)
+gg
+```
+
+```{r}
+gg = ggplot(info_full3, aes(rel_mtime_cut, nsongs)) 
+gg = gg + geom_rect(ymin=-Inf, ymax=Inf, aes(xmin=rel_drug_start, xmax=rel_drug_stop), fill="grey", alpha=.1)
+gg = gg + geom_point()
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + theme_bw()
+gg = gg + labs(x="Hours from treatment onset", y="Number of songs")
+gg = gg + lims(x=c(-5, 12))
+gg
+ggsave(paste(plot_dir, "song_rate_common_axis.pdf", sep="/"))
+```
+
+```{r}
+gg = ggplot(info_full3, aes(rel_mtime_cut, nsongs)) 
+gg = gg + geom_rect(ymin=-Inf, ymax=Inf, aes(xmin=rel_drug_start, xmax=rel_drug_stop), fill="grey", alpha=.1)
+gg = gg + geom_point()
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + theme_bw()
+gg = gg + labs(x="Hours from treatment onset", y = "Number of songs")
+#gg = gg + lims(x=c(-5, 12))
+gg
+ggsave(paste(plot_dir, "song_rate.pdf", sep="/"))
+```
+
+No obvious change in song rate.
+Except depression with 10 uM CRH/CRH (6-33)
+
+
+# Sequencing
+## Transition entropy
+```{r}
+dest_table = "transitions"
+d = NULL
+trans = NULL
+redo=F
+if (!db_has_table(db$con, dest_table) || redo) {
+  d = info %>% 
+    #filter(bird=="pu37bk12") %>%
+    group_by(bird, mat) %>% 
+    do(process_syllable_matrix(., NULL, deselect=c(" ", "-", "i"), norm="total", 
+                               max_gap_size=500))
+  d = na.omit(d)
+  trans = d %>% 
+    group_by(mat, bird) %>% 
+    do({mean_transition_entropy_long(.)})
+  if (redo && db_has_table(db$con, dest_table))
+    db_drop_table(db$con, dest_table)
+  copy_to(db, trans, dest_table, temporary = F)
+} else {
+  trans = collect(tbl(db, dest_table))
+}
+trans = trans %>% left_join(info)
+```
+
+```{r}
+trans = trans %>% 
+  #group_by(bird) %>%
+  mutate(transition_entropy_z = zscore_my(transition_entropy, transition_entropy[mtime<drug_times$drug_time[drug_times$log.drug=="CRH"]])) %>% 
+  mutate(transition_entropy_z_abs = abs(transition_entropy_z))
+```
+
+```{r}
+gg = ggplot(trans, aes(period, transition_entropy))
+gg = gg + geom_point(alpha=.5, position=position_jitter(width=.2))
+gg
+ggsave(paste(plot_dir, "transition_entropy.pdf", sep="/"), width=6, height=6)
+```
+
+## Repeat lengths
+```{r}
+dest_table = "repeats"
+d = NULL
+if (!db_has_table(db$con, dest_table) || redo) {
+  d = info %>% group_by(bird) %>% do(repeat_lengths(.))
+  if (redo && db_has_table(db$con, dest_table))
+    db_drop_table(db$con, dest_table)
+  copy_to(db, d, dest_table, temporary = F)
+} else {
+  d = collect(tbl(db, dest_table))
+}
+d = merge(d, info)
+```
+
+```{r}
+stats = d %>% filter(mtime < drug_times$drug_time[1]) %>% group_by(bird, values) %>% summarize(lengths_mean = mean(lengths),
+                                                                          lengths_med = median(lengths),
+                                                                          lengths_mode = as.numeric(names(which.max(table(lengths)))),
+                                                                          lengths_sd = sd(lengths))
+```
+
+```{r}
+d = d %>% left_join(stats)
+```
+
+```{r}
+d = d %>% mutate(lengths_norm_mean = lengths / lengths_mean,
+                 lengths_norm_med = lengths / lengths_med,
+                 lengths_norm_mode = lengths / lengths_mode,
+                 lengths_norm_mean_log2 = log2(lengths_norm_mean))
+```
+
+```{r}
+d1 = d %>% group_by(bird, log.drug, values) %>% do({
+  data.frame(calc_mean_sd(.$lengths_norm_mean, "lengths_norm_mean"),
+             calc_mean_sd(.$lengths_norm_med, "lengths_norm_med"),
+             calc_mean_sd(.$lengths_norm_mode, "lengths_norm_mode"),
+             calc_mean_sd(.$lengths_norm_mean_log2, "lengths_norm_mean_log2"))
+}) 
+d1 = merge(d1, info)
+```
+
+
+```{r}
+gg = ggplot(d %>% filter(!(values %in% c("-"))), aes(lengths)) 
+gg = gg + geom_
+gg = gg + facet_grid(log.drug~values, scales="free")
+gg
+```
+
+# Tempo
+```{r}
+plot_tempo_dir = file.path(plot_dir, "tempo")
+dir.create(plot_tempo_dir)
+```
+
+```{r}
+audio_input = "wav"
+mats = load_mat_batch(info1, 
+                      #data_db=db,
+                      #tname=tname,
+                      replace_data=F,
+                      #index_cols=c("labels", "mat"),
+                      #addl_filters=list(c("labels", label)),
+                      parallel=F,
+                      audio_input=audio_input)
+```
+
+```{r}
+tempo = mats %>% group_by(mat) %>% do({
+  d = .
+  data.frame(d, tempo_val=as.numeric(calc_tempo(d)))
+})
+# tempo = mats %>% group_by(mat) %>% summarize(tempo_val = as.numeric(calc_tempo(.)))
+tempo = tempo %>% left_join(info) %>% distinct(mat, .keep_all=T)
+```
+
+```{r}
+tempo = tempo %>% mutate(period = factor(period, levels=c("PRE", "POST")))
+gg = ggplot(tempo, aes(period, tempo_val))
+gg = gg + geom_point(alpha=.2, position=position_jitter(width=.2))
+gg = gg + geom_violin()
+#gg = gg + facet_wrap(~expt)
+gg = gg + ylim(7, 10)
+gg
+```
+
+```{r}
+tempo_roll = mats %>% group_by(mat) %>% do({
+  d = . 
+  res = calc_rolling_tempo(d)
+  data.frame(d, tempo_mean = res[[1]], tempo_sd = res[[2]])
+}) %>% distinct(mat, .keep_all=T)
+tempo = tempo %>% left_join(info)
+tempo = ungroup(tempo) %>% mutate(tempo_mean_z = zscore_my(tempo_mean, tempo_mean[period=="PRE"]))
+
+tempo_group = tempo %>% group_by(period, rel_date) %>%
+  summarize(tempo_mean = mean(tempo_mean, na.rm=T),
+            tempo_sd = sd(tempo_mean, na.rm=T)) %>%
+  ungroup() %>%
+  mutate(tempo_mean_change = perc_change(tempo_mean, tempo_mean[period=="PRE"])) %>% # 100 * (tempo_mean - tempo_mean[period=="PRE"]) / 
+              #tempo_mean[period=="PRE"]) %>%
+  left_join(info) %>% distinct(period, .keep_all=T)
+```
+
+```{r}
+labs_cur = labs(x="Day relative to knockdown", y="mean tempo, syls/s")
+tmp = tempo %>% filter(!is.na(period)) %>%
+  mutate(period = factor(period, levels=c("PRE", "POST")))
+gg = ggplot(tmp, aes(period, tempo_mean))
+gg = gg + geom_point(alpha=.1, position=position_jitter(width=.2))
+#gg = gg + geom_hline(yintercept = 0, linetype=2)
+#gg = gg + facet_wrap(~expt)
+gg = gg + ylim(8, 11)
+gg = gg + labs_cur
+gg
+
+gg = ggplot(tmp, aes(rel_date, tempo_mean))
+gg = gg + geom_point(alpha=.1, position=position_jitter(width=.2))
+#gg = gg + geom_hline(yintercept = 0, linetype=2)
+#gg = gg + facet_wrap(~expt)
+gg = gg + ylim(8, 11)
+gg = gg + labs_cur
+gg
+wid = length(unique(tmp$rel_date))
+save_plot(file.path(plot_tempo_dir, "rolling_tempo_by_date.pdf"), gg, base_width=wid, base_height=3)
+```
+
+```{r}
+tmp = tempo_group %>% ungroup() %>%
+filter(date > "2018-03-03", date < "2018-03-22") %>%
+  filter(!(expt %in% c("PBS-control (6)")))  %>%# Recording error in morning
+  filter(expt_group %in% c("PBS", "AP5", "CRH")) %>% 
+  mutate(expt_group = factor(expt_group, levels=c("no-cannulae", "no-probe", "PBS", "AP5", "CRH"))) %>%
+  arrange(expt_group) %>%
+  mutate(expt = factor(expt, levels=filts, ordered = F)) %>%
+  filter(!is.na(expt)) %>%
+  filter(period != "PRE")
+gg = ggplot(tmp, aes(expt_group, tempo_mean_change, color=expt_group))
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg = gg + geom_point(position = position_jitter(width=.2))
+gg = gg + facet_grid(.~period, scales="free_y")
+gg = gg + scale_color_manual(values=colors)
+gg = gg + labs(x = "", y = "e")
+gg = gg + theme(panel.spacing.y = unit(2, "lines"),
+                strip.text.y=element_text(angle=0),
+                legend.position="none")
+gg
+save_plot(file.path(plot_dir, "tempo_expt_group.pdf"), gg, ncol = 1, nrow=1, base_height = 5)
+save_plot(file.path(plot_dir, "tempo_group.png"), gg, ncol = 1, nrow=1, base_height = 5)
+```
+
+## Syllable diversity
+```{r}
+dest_table = "syl_stats"
+d1 = NULL
+redo=T
+if (!db_has_table(db$con, dest_table) || redo) {
+  d1 = info %>% group_by(bird, mat) %>% do(process_syllable_matrix(., NULL, deselect=c("-", " ", "n"), norm="none"))
+  if (redo && db_has_table(db$con, dest_table))
+    db_drop_table(db$con, dest_table)
+  copy_to(db, d1, dest_table, temporary = F)
+} else {
+  d1 = collect(tbl(db, dest_table))
+}
+d1 = d1 %>% left_join(info)
+```
+
+```{r}
+d2_num = d1 %>% group_by(bird, mat) %>% filter(value>0, From != "start") %>% summarize(nsyllables=length(unique(From)))
+d2_num = d2_num %>% left_join(info)
+```
+
+```{r}
+d3_num = d2_num %>% group_by(expt, period, bird) %>%
+  do(data.frame(nsyllables_med = median(.$nsyllables),
+                nsyllables_q25 = quantile(.$nsyllables, probs = .25),
+                nsyllables_q75 = quantile(.$nsyllables, probs = .75)))
+d3_num = merge(d3_num, comb)
+```
+
+
+```{r}
+d2 = d1 %>% group_by(mat, From) %>%
+  summarize(value=sum(value)) %>%
+  group_by(mat) %>%
+  mutate(value_norm = value / sum(value)) %>%
+  filter(From!="start")
+d2 = d2 %>% left_join(info)
+```
+
+```{r}
+d3 = d2 %>% group_by(From, bird, expt, period) %>% summarize(value_norm_mean = mean(value_norm, na.rm=T))
+d3$value_norm_mean_flip = ifelse(d3$period=="POST", d3$value_norm_mean, -1 * d3$value_norm_mean)
+d3 = d3 %>% left_join(info)
+```
+
+```{r}
+gg = ggplot(d3 %>% filter(period %in% c("PRE", "POST")), aes(From, value_norm_mean_flip, fill=period))
+gg = gg + geom_bar(position="identity", stat="identity") 
+gg = gg + coord_flip() 
+gg = gg + facet_wrap(~expt) #+ fills
+gg
+```
+
+```{r}
+gg = ggplot(d3 %>% filter(period %in% c("PRE", "POST")), aes(From, value_norm_mean, fill=period))
+gg = gg + geom_bar(position="dodge`", stat="identity") 
+#gg = gg + coord_flip() 
+gg = gg + facet_wrap(~expt) #+ fills
+gg
+```
+
+
+
+# Plot example songs
+```{r}
+song_dir = file.path(plot_dir, "songs")
+dir.create(song_dir)
+```
+
+```{r}
+cur_songs = list.files(songs_dir, pattern="wav$", full.names = T)
+```
+
+```{r}
+audio_input = "wav"
+info1 = info %>% 
+  filter(wav %in% cur_songs)%>% 
+  filter(rel_date>=-4) %>% 
+  group_by(rel_date) %>%
+  #filter(period=="DRUG") %>% 
+  sample_n(1) %>% distinct(wav, .keep_all=T)
+
+
+songs = parse_song_batch2(info1$wav, peak_source="mat")
+songs1 = songs[[1]]
+
+songs1 = map(1:length(songs1), function(i) {
+  cur = songs1[[i]]
+  cur$rel_date = info1$rel_date[i]
+  cur
+})
+```
+
+```{r warning=FALSE}
+map(songs1, function(s) {
+  wav_prefix = basename(sub(".wav", "", s$fname))
+  print(wav_prefix)
+  #expt = s$expt
+  rel_date = s$rel_date
+  fname = file.path(song_dir, sprintf("rel_date%s.pdf", rel_date))
+  if (nrow(s$motifs) > 0) {
+    subregion = c(s$motifs[, "ins"], s$motifs[,"outs"])
+  } else {
+    return()
+  }
+  gg = plot_spectro(s$wav, subregion = NULL, labels = s$syllable, label_name = "labels")
+  gg = gg + labs(title=wav_prefix)
+  save_song_spectrogram(gg, s, fname)
+  fname_png = sub(".pdf", ".png", fname)
+  save_song_spectrogram(gg, s, fname_png)
+  
+})
+```
+
+
+

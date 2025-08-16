@@ -1,0 +1,2137 @@
+---
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(R.matlab)
+library(stringr)
+library(parallel)
+library(lubridate)
+library(Cairo)
+source("~/src/songanalysis/song_util.R")
+source("~/src/songanalysis/song_db.R")
+source("~/src/songanalysis/song_ff.R")
+source("~/src/songanalysis/deafen_plot.R")
+source("~/src/songanalysis/song_plot.R")
+source("~/data2/rstudio/birds/utils/dialysis.R")
+source("~/data2/rstudio/birds/utils/hvc.R")
+source("~/data2/rstudio/birds/utils/db.R")
+source("~/data2/rstudio/birds/utils/stats.R")
+
+source("~/data2/rstudio/birds/utils/mixed_model2.R")
+library(tidyverse)
+library(broom)
+library(here)
+library(cowplot)
+library(lmerTest)
+library(car)
+```
+
+```{r}
+registerDoMC(cores=6)
+```
+
+```{r}
+filter = dplyr::filter
+summarize = dplyr::summarize
+mutate = dplyr::mutate
+select = dplyr::select
+here = here::here
+map = purrr::map
+```
+
+# Load info 
+```{r}
+prefix_song = "/mnt/bengal_home/song"
+prefix_data = here()
+prefix_data = "~/data2/rstudio/birds/deafen/song_analysis/knockdown/"
+```
+
+```{r}
+birds = c( 
+  "or46pu99",  "pu17bk34",  "or53or14",  "rd37rd56", "bu82wh76", "or95bk93", "bu33or29", # control
+  "rd23gr10", "pu30bk80", "wh20pk99", "rd35rd54",  "or83or25", # CRHBP
+  "rd84gr50","rd25gr70", "rd34wh99", "pk61gr23", "or56or29",   "bu88bu26", "or45pu98" # CRH
+)
+
+birds_to_exclude = c("pu17bk34", "rd37rd56") # large gliosis scars in RA
+```
+
+```{r}
+data_sub_dirs = purrr::map(birds, ~file.path(prefix_data, .x))
+data_dir = file.path(prefix_data, "combined_crh")
+dir.create(data_dir)
+plot_dir = paste(data_dir, "figures", sep="/")
+dir.create(plot_dir, recursive=T)
+```
+
+```{r message=FALSE, warning=FALSE}
+options(httr_oob_default=TRUE)
+dates_to_proc = list(c("songs"))
+dial_log = load_knockdown_gs(birds)
+info = map(birds, function(x) {
+  print(x)
+  load_song_info_event(x, "songs", subdir="", log_data=dial_log, tz="PDT")
+}) %>%
+  bind_rows()
+info = info %>% distinct(wav, .keep_all=T)
+```
+
+### Group siRNAs
+```{r}
+sirna_groups = data.frame(log.sirna = c("none", "SLC17A6", "control", "CRHBP (1-3)", "CRHBP (1-3, set2)", "CRH (set1)"),
+                          log.sirna2 = c("none", "SLC17A6", "control", "CRHBP", "CRHBP", "CRH"))
+info = info %>% left_join(sirna_groups)
+```
+
+### Metadata cleanup
+```{r}
+info = info %>% mutate(period = if_else(rel_date< 0, "PRE", "POST"))
+info = info %>% mutate(wav_base = basename(wav),
+                        mat_base = basename(mat))
+## Remove double backslashes
+info = info %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+
+```
+
+### Write out for KL
+```{r}
+info_kl = info %>% rename(Date.of.surgery = event.date)
+saveRDS(info_kl, file.path(prefix_data, "lik", "bird_info.rds"))
+
+info_kl = info %>% rename(Date.of.surgery = event.date) %>% filter(bird=="rd23gr10")
+saveRDS(info_kl, file.path(prefix_data, "lik", "bird_info_test.rds"))
+```
+
+# Set up data db
+```{r}
+db = src_sqlite(file.path(data_dir, "combined.db"), create=T)
+db_sub_dirs = map_chr(birds, ~file.path(prefix_data, .x, sprintf("%s.db", .x))) %>% set_names(birds)
+```
+
+# Plotting
+```{r}
+by_day = file.path(plot_dir, "by_day")
+dir.create(by_day)
+
+across_days = file.path(plot_dir, "across_days")
+dir.create(across_days)
+```
+
+```{r}
+hl = geom_hline(yintercept=0, linetype=3)
+th = theme_bw() + theme(axis.text.x = element_text(angle=45, hjust=1),
+                        strip.text.y = element_text(angle=0))
+li = ylim(-6, 6)
+scc = scale_color_manual("", values=c("red", "black", "blue"))
+scx = scale_x_datetime(date_breaks="4 hours", 
+                   labels=date_format("%m-%d %H:%M",
+                                      tz="America/Los_Angeles"))
+gu = guides(colour = guide_legend(override.aes = list(alpha=1)))
+xl = xlab("")
+yl = ylab("Z-score")
+fig_width=8
+fig_height=8
+
+```
+
+
+```{r}
+plot_across_time_current = function(data, value, drug_times1) {
+  gg = plot_within_day(data , value, 
+                       x_value = "rel_mtime",
+                       #datetime_sections = drug_times1,
+                       group_factor = NULL,
+                       facet_factor = "labels", 
+                       color_factor = NULL, 
+                       alpha=.1)
+  gg = gg + facet_wrap(~labels, scales="free_x")
+  gg = gg + th + gu + xl + yl + scc
+  gg = gg + labs(title=value)
+  gg
+}
+```
+
+```{r}
+plot_grouped_current = function(data, value, group) {
+  gg = ggplot(data, aes_string(group, value, color=group))
+  gg = gg + ggp + gf + gth + gli + ghl + gxl
+  ggsave(paste(plot_dir, sprintf("%s_group.pdf", value), sep="/"), plot=gg, width=8, height=8)
+  return(gg)
+}
+```
+
+# Song rates
+```{r}
+rates_dir = file.path(plot_dir, "rates")
+dir.create(rates_dir)
+```
+
+```{r}
+res = 1
+info = info %>% 
+  mutate(datetime_hour = cut(mtime,
+                             breaks=seq(min(floor_date(mtime, "hour"), na.rm=T),
+                                        max(ceiling_date(mtime, "hour"), na.rm=T), 3600)),
+         datetime_ten_min = cut(mtime,
+                                breaks=seq(min(floor_date(mtime, "hour"), na.rm=T),
+                                           max(ceiling_date(mtime, "hour"), na.rm=T), 600)),
+         rel_mtime_cut = cut(rel_mtime, breaks = seq(floor(res*min(rel_mtime, na.rm=T))/res,
+                                                     ceil(res*max(rel_mtime, na.rm=T))/res,
+                                                     1/res)),
+         rel_mtime_cut_num = as.numeric(rel_mtime_cut)
+         )
+#info_full = info_full %>% mutate(rel_mtime_cut = map(str_split(rel_mtime_cut, ","), 2) %>% map_dbl(~as.numeric(gsub("]", "", .x))))
+```
+
+```{r}
+info_full = info %>% distinct(wav_base, .keep_all=T)
+info_full1 = info_full %>% group_by(bird, datetime_ten_min) %>% summarize(nsongs = n()) %>%
+  mutate(datetime_ten_min = as.POSIXct(datetime_ten_min)) %>% ungroup()
+
+
+info_full2 = info_full %>% group_by(bird, datetime_hour) %>% summarize(nsongs = n()) %>%
+  mutate(datetime_hour = as.POSIXct(datetime_hour)) %>% ungroup()
+
+info_full3 = info_full %>% group_by(bird, datetime_hour, rel_date) %>% 
+  summarize(nsongs_per_hour = n()) %>%
+  ungroup() %>%
+  group_by(bird, rel_date) %>% summarize(nsongs_mean = mean(nsongs_per_hour),
+                                         nsongs_median = median(nsongs_per_hour),
+                                         nsongs_sd = sd(nsongs_per_hour)) %>%
+  filter(!is.na(rel_date)) %>% 
+  ungroup() %>%
+  group_by(bird) %>%
+  filter(rel_date>min(rel_date)) %>%
+  left_join(info %>% select(bird, rel_date, log.sirna)) %>%
+  distinct(bird, rel_date, .keep_all=T) %>%
+  mutate(nsongs_rel = nsongs_mean / mean(nsongs_mean[rel_date<=0]),
+         nsongs_rel_log = log2(nsongs_rel),
+         nsongs_perc = perc_change(nsongs_mean, nsongs_mean[rel_date<=0]))
+  
+
+info_by_day = info_full %>% group_by(bird, rel_date) %>% summarize(nsongs = n()) %>%
+  filter(!is.na(rel_date)) %>% 
+  ungroup() %>%
+  group_by(bird) %>%
+  filter(rel_date>min(rel_date)) %>%
+  #ungroup() %>%
+  #group_by(bird, ) %>%
+  left_join(info %>% select(bird, rel_date, log.sirna)) %>%
+  distinct(bird, rel_date, .keep_all=T) %>%
+  mutate(nsongs_rel = nsongs / mean(nsongs[rel_date<=0]),
+         nsongs_rel_log = log2(nsongs_rel),
+         nsongs_perc = perc_change(nsongs, nsongs[rel_date<=0]))
+```
+
+```{r}
+tmp = info_by_day %>%
+  filter(log.sirna != "none") %>%
+  filter(rel_date >=-4, rel_date <= 8)
+gg = ggplot(tmp, aes(rel_date, nsongs_rel, color=bird))
+
+gg = gg + geom_hline(yintercept=1, linetype=2)
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_point(position=position_jitter(width=.2))
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="Number of songs")
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_by_day.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+```
+general reduction of song rate in all conditions
+
+```{r}
+tmp = info_by_day %>%
+  filter(log.sirna != "none") %>%
+  filter(rel_date >=-4, rel_date <= 8)
+gg = ggplot(tmp, aes(rel_date, nsongs_rel, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=1, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="Number of songs")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_by_day_line_fold.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+gg = ggplot(tmp, aes(rel_date, nsongs_perc, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=1, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="% change in songs per day")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_by_day_line_perc.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+
+gg = ggplot(tmp, aes(rel_date, nsongs_rel_log, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="Number of songs")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_by_day_line_log.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+```
+
+```{r}
+tmp = info_full3 %>%
+  filter(log.sirna != "none") %>%
+  filter(rel_date >=-4, rel_date <= 8)
+gg = ggplot(tmp, aes(rel_date, nsongs_rel, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=1, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="Number of songs")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_per_hour_by_day_line_fold.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+gg = ggplot(tmp, aes(rel_date, nsongs_perc, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=1, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="% change in songs per day")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_per_hour_by_day_line_perc.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+
+gg = ggplot(tmp, aes(rel_date, nsongs_rel_log, color=bird))
+
+gg = gg + geom_vline(xintercept=0, linetype=2)
+gg = gg + geom_hline(yintercept=0, linetype=1)
+
+gg = gg + geom_line(aes(group=bird)) + geom_point(shape=21, aes(color=bird)) 
+gg = gg + facet_grid(log.sirna~.)
+gg = gg + labs(x="Days from siRNA injection", y="Number of songs")
+
+gg
+ndays = length(unique(tmp$rel_date))
+nrows = length(unique(tmp$log.sirna))
+save_plot(paste(rates_dir, "song_rate_by_per_hour_day_line_log.pdf", sep="/"), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+```
+
+# Load features
+```{r}
+reload = F
+tname3 = "syls"
+if (reload) {
+  base_dir = "/mnt/bengal_home/song/%s/songs/autolabel"
+  data_dirs = map(unique(info$bird), ~sprintf(base_dir, .x))
+  data_files = map(data_dirs, function(x) {
+    list.files(x, pattern=".db$", full.names = T)
+  })
+
+  features = map(data_files, load_hvc_db)
+  syls = bind_rows(features)
+  
+  redo = T
+  if (redo && db_has_table(db$con, tname3))
+    db_drop_table(db$con, tname3)
+  copy_to(db, syls, tname3, temporary=F)
+} else {
+  syls = collect(tbl(db, tname3), n=Inf)
+}
+
+syls = syls %>%
+  rename(went_mean = mean_spectral_flatness,
+         amp_mean = mean_amplitude) %>%
+  mutate(wav_base = basename(wav))
+```
+
+```{r}
+syls1 = left_join(syls %>% select(-wav), info)
+```
+
+### Filter by date range
+```{r}
+syls1 = syls1 %>% filter(rel_date>=-4)
+```
+
+### No filtering by prediction
+```{r}
+syls1 = syls1 %>% mutate(went_mean_log2 = log2(went_mean),
+                        # went_var_log2 = log2(went_var),
+                         amp_mean_log2 = log2(amp_mean),
+                         went_mean_norm_amp_mean_log2 = went_mean_log2 + amp_mean_log2)
+```
+
+```{r}
+features_dir = file.path(plot_dir, "features")
+dir.create(features_dir)
+```
+
+```{r}
+vars_string = c("went_mean_log2", "amp_mean_log2", "duration", 
+                "mean_spectral_centroid",
+                "mean_spectral_spread","mean_spectral_skewness", "mean_spectral_kurtosis",
+                "mean_spectral_slope", "mean_pitch","mean_pitch_goodness", 
+                "mean_delta_spectral_flatness", "mean_delta_pitch",
+                "pred_ent")
+vars_cur = vars(vars_string)
+```
+
+```{r}
+
+plot_versus_amp = function(dat, value) {
+  print(value)
+  gg = ggplot(dat %>% sample_frac(.05), aes_string("amp_mean_log2", sprintf("%s", value))) 
+  gg = gg + geom_point(alpha=.1)
+  gg = gg + facet_wrap(~labels, scales="free")
+  ncols = 4
+  nrows=length(unique(dat$labels)) / ncols
+  save_plot(file.path(features_dir, sprintf("%s_versus_amp.pdf", value)), gg, nrow=nrows, ncol=ncols, base_height=1.5)
+  return(gg)
+}
+tmp = syls1 %>%
+  filter(bird=="wh20pk99") %>%
+  sample_frac(.05)
+map(vars_string, ~plot_versus_amp(tmp, .x))
+```
+
+Spectral slope is almost completely determined by amplitude
+```{r}
+# variables to correct for amplitude
+to_correct = c("duration", "mean_pitch_goodness", "mean_spectral_spread")
+```
+
+
+```{r warning=FALSE}
+safe_lm = function(d) {
+  d = d[! (is.na(d$went_mean_log2) | is.na(d$amp_mean_log2)),]
+  if (nrow(d) < 10) {
+    return(data.frame(went_mean_log2_res = NA,
+                      went_mean_log2_res2 = NA,
+                      went_mean_log2=NA,
+                      mean_pitch_goodness_res=NA,
+                      duration_res = NA,
+                      mean_spectral_spread_res = NA,
+                      mat=NA))
+  }
+  mod = lm(went_mean_log2 ~ amp_mean_log2, data=d)
+  mod2 = lm(went_mean_log2 ~ stats::poly(amp_mean_log2,2), data=d)
+  mod_pg = lm(mean_pitch_goodness ~ amp_mean_log2, data=d)
+  mod_dur = lm(duration ~ amp_mean_log2, data=d)
+  mod_ss = lm(mean_spectral_spread ~ amp_mean_log2, data=d)
+  
+  return(data.frame(went_mean_log2_res=residuals(mod),
+                    went_mean_log2_res2=residuals(mod2),
+                    went_mean_log2=d$went_mean_log2, 
+                    mean_pitch_goodness_res=residuals(mod_pg),
+                    duration_res = residuals(mod_dur),
+                    mean_spectral_spread_res = residuals(mod_ss),
+                    mat=d$mat))
+}
+lms = syls1 %>% group_by(bird, labels) %>% do({
+  d = .
+  safe_lm(d)
+})
+syls1 = left_join(syls1, lms)
+```
+
+
+```{r}
+plot_versus_amp = function(dat, value) {
+  print(value)
+  gg = ggplot(dat, aes_string("amp_mean_log2", sprintf("%s", value))) 
+  gg = gg + geom_point(alpha=.1)
+  gg = gg + facet_wrap(~labels, scales="free")
+  ncols = 4
+  nrows=length(unique(dat$labels)) / ncols
+  save_plot(file.path(features_dir, sprintf("%s_versus_amp.pdf", value)), gg, nrow=nrows, ncol=ncols, base_height=1.5)
+  return(gg)
+}
+
+tmp = syls1 %>%
+  filter(bird=="wh20pk99") %>%
+  sample_frac(.05)
+map(paste(to_correct, "res", sep="_"), ~plot_versus_amp(tmp, .x))
+```
+
+```{r}
+vars_string = c(vars_string, c("went_mean_log2_res", "went_mean_log2_res2", "mean_pitch_goodness_res", "duration_res", "mean_spectral_spread_res"))
+vars_cur = vars(vars_string)
+```
+
+```{r}
+syls1 = syls1 %>% mutate(baseline = rel_date<=0)
+syls1a = syls1 %>% group_by(bird, labels) %>%
+  do({
+    d = .
+    d  %>% mutate_at(vars_cur, list(z = "zscore_my"), baseline=d$baseline)
+     
+  })
+
+syls1a = syls1a %>% ungroup()
+```
+
+#### Grouped
+```{r}
+group_dir = file.path(plot_dir, "grouped")
+dir.create(group_dir)
+```
+
+```{r}
+vars_cur_z = paste(vars_string, "z", sep="_")
+syls2 = syls1a %>% group_by(bird, labels, rel_date) %>% summarize_at(vars_cur_z, funs(mean, median, sd))
+syls2 = syls2 %>% left_join(info) %>% distinct(bird, rel_date, labels, .keep_all=T)
+```
+
+```{r}
+vars_form = c("Wiener entropy", "Syllable amplitude", "Syllable duration", "Spectral centroid", "Spectral spread", "Spectral skewness", "Spectral kurtosis", "Spectral slope", "Mean pitch", "Pitch goodness", "Delta spectral flatness", "Delta pitch", "Classification entropy",  "Wiener entropy (amplitude-corrected)", "Wiener entropy (amplitude-corrected)", "Pitch goodness (amplitude-corrected)", "Syllable duration (amplitude-corrected)", "Spectral spread (amplitude-corrected)")
+names(vars_form) = vars_cur_z
+```
+
+```{r}
+
+plot_grouped_across_time = function(syls2, value) {
+  print(value)
+  tmp = syls2 %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", sprintf("%s_mean", value), color="bird")) 
+  gg = gg + geom_point(position = position_jitter(width=.2))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + ylim(-4, 4)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value])
+  gg = gg + theme_cowplot()
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  return(gg)
+}
+map(vars_cur_z, ~plot_grouped_across_time(syls2, .x))
+```
+spectral slope is linear regression of normalized power spectrum. Indicates the general relative weightings of power bands, with higher values indicating more power at higher frequencies...
+
+```{r}
+plot_grouped_across_time_dodge = function(syls2, value) {
+  print(value)
+  tmp = syls2 %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", sprintf("%s_mean", value), color="bird")) 
+  gg = gg + geom_point(position = position_jitterdodge(jitter.width=.1, dodge.width = .5))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + ylim(-4, 4)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s_dodge.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+  #return(gg)
+}
+map(vars_cur_z, ~plot_grouped_across_time_dodge(syls2, .x))
+```
+```{r}
+vars_cur_z_mean = paste(vars_cur_z, "_mean", sep="")
+up = function(x,y) {x+y}
+low = function(x,y) {x-y}
+syls3 = syls2 %>% group_by(rel_date, bird, log.sirna2) %>% summarize_at(vars(vars_cur_z_mean), list(mean="mean_na", sem="sem_na", sd="sd_na")) 
+```
+
+
+```{r}
+plot_grouped3_across_time = function(dat, value) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value_trim])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+value = "amp_mean_log2_z_mean"
+plot_grouped3_across_time(syls3, value)
+
+```
+
+```{r}
+map(vars_cur_z_mean, ~plot_grouped3_across_time(syls3, .x))
+```
+#### Modeling
+
+```{r}
+group_modeling_dir = file.path(group_dir, "models")
+dir.create(group_modeling_dir)
+```
+
+```{r}
+run_anova_group = function(model) {
+  res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  res_tidy = bind_rows(res_tidy, an)
+  res_tidy
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r}
+min_date = -3
+max_date = 8
+```
+
+```{r message=FALSE, warning=FALSE}
+run_lmer_model = function(dat, des, value) {
+  print(value)
+  rename_func = function(x) "value"
+  
+  tmp = dat %>% ungroup() %>%
+    rename_at(vars(matches(value)), rename_func)
+  
+  tmp = tmp %>% group_by(rel_date) %>%
+    do({
+      #print(.$rel_date[1])
+      mod = lme4::lmer(des, .,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+      coefs = extract_coefs(mod)
+      mod_an = run_anova_group(mod)
+      mod_an_m = melt(mod_an) %>%
+        rename(coef = term,
+               coef_type = variable) %>%
+        mutate(level = "anova")
+      coefs = bind_rows(coefs, mod_an_m)
+      coefs
+    })
+}
+
+nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+nsyls = nsyls %>% filter(n>200)
+tmp = syls1a %>% 
+  filter(rel_date>=min_date, rel_date <= max_date) %>%
+  mutate(log.sirna2 = factor(log.sirna2)) %>%
+  inner_join(nsyls) %>%
+ # filter(rel_date == 2) %>%
+  # filter(labels %in% c("a", "b")) %>%
+  filter(log.sirna2 %in% c("control", "CRHBP")) %>%
+  group_by(bird, rel_date, labels) %>%
+  sample_n(200) %>%
+  ungroup()
+  
+#des = value ~ log.sirna2 + (1 + log.sirna2 | bird / labels)
+des = value ~ log.sirna2 + (1 | bird / labels)
+#mod = run_lmer_model(tmp, des, "amp_mean_log2_z")
+mods = map(vars_cur_z, ~run_lmer_model(tmp, des, .x)) %>% 
+  set_names(vars_cur_z) %>%
+  bind_rows(.id="variable")
+```
+
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="log.sirna2") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup()
+```
+
+```{r}
+plot_sig_values = function(dat, val) {
+  print(val)
+  tmp = dat %>% filter(variable==val)
+
+  gg = ggplot(tmp, aes(rel_date, log10(value), color=sig))
+  gg = gg + geom_point()
+  gg = gg + labs(title=val)
+  gg = gg + geom_hline(yintercept=0, linetype=1)
+  gg = gg + geom_hline(yintercept=log10(.05), linetype=2)
+    gg = gg + ylim(min(log10(tmp$value)), 0)
+  #gg
+  
+  gg1 = ggplot(tmp, aes(rel_date, log10(padj), color=sig))
+  gg1 = gg1 + geom_point()
+  gg1 = gg1 + labs(title=val)
+  gg1 = gg1 + geom_hline(yintercept=0, linetype=1)
+  gg1 = gg1 + geom_hline(yintercept=log10(.05), linetype=2)
+  gg1 = gg1 + ylim(min(log10(tmp$value)), 0)
+  #gg1
+  
+  plot_grid(gg, gg1, align = "hv", ncol=2)
+}
+vars_sig = unique(mods_p$variable)
+map(vars_sig, ~plot_sig_values(mods_p, .x))
+```
+
+
+```{r}
+sig_values = mods_p %>% filter(sig)
+```
+
+```{r}
+plot_grouped3_across_time_with_sig = function(dat, value, sig_values) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none", "SLC17A6")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+
+  val = sub("_mean$", "", value)
+  print(val)
+  sig_value = sig_values %>% 
+    filter(variable==val) %>%
+    mutate(log.sirna2 = "CRHBP")
+  gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value_trim])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  
+  save_plot(file.path(group_dir, sprintf("%s_with_sig.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+value = "amp_mean_log2_z_mean"
+
+plot_grouped3_across_time_with_sig(syls3, value, sig_values)
+
+```
+
+```{r}
+map(vars_cur_z_mean, ~plot_grouped3_across_time_with_sig(syls3, .x, sig_values))
+```
+#### Significance testing relative to baseline
+```{r}
+# gg = ggplot(d, aes(rel_date, value, color=bird)) + 
+#   geom_point(alpha=.1, position=position_dodge(width=.2))
+# gg
+```
+
+```{r message=FALSE, warning=FALSE}
+
+redo = T
+fname = file.path(group_modeling_dir, "relative_to_baseline.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(matches(value)), rename_func)
+    
+    tmp %>% 
+      group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lmerTest::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  nsyls = nsyls %>% filter(n>200)
+  cur = syls1a %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna2 = factor(log.sirna2)) %>%
+    
+    inner_join(nsyls) %>%
+    #filter(rel_date == 2) %>%
+    # filter(labels %in% c("a", "b")) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH"))
+
+  
+  #des = value ~ period + (1 + period | bird / labels)
+  des = value ~ period + (1 | bird / labels)
+  post_rel_dates = 1:8
+  vars_cur_z1 = vars_cur_z[2]
+  
+  mods = map(vars_cur_z, function(x) {
+    print(x)
+    map(post_rel_dates, function(y) {
+      print(y)
+    
+      cur1 = cur %>% filter(period=="PRE" | rel_date == y) %>%
+        group_by(bird, period, log.sirna2, labels) %>%
+        sample_n(20) %>%
+        ungroup()
+      run_lmer_model(cur1, des, x)
+    }) %>% 
+      set_names(post_rel_dates) %>% 
+      bind_rows(.id="rel_date")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+Average each syllable by day first
+```{r message=FALSE, warning=FALSE}
+
+redo = T
+fname = file.path(group_modeling_dir, "relative_to_baseline.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(matches(value)), rename_func)
+    
+    tmp %>% 
+      group_by(log.sirna2) %>%
+      do({
+        d = .
+        mod = lmerTest::lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  nsyls = syls1a %>% group_by(rel_date, bird, labels) %>% summarize(n=n())
+  nsyls = nsyls %>% filter(n>200)
+  cur = syls1a %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(log.sirna2 = factor(log.sirna2)) %>%
+    inner_join(nsyls) %>%
+    group_by(rel_date, bird, labels, log.sirna2, period) %>%
+    summarize_at(vars_cur_z, list(mean = "mean_na", sem = "sem")) %>%
+    filter(log.sirna2 %in% c("control", "CRHBP", "CRH"))
+
+  
+  #des = value ~ period + (1 + period | bird / labels)
+  des = value ~ period + (1 | bird / labels)
+  post_rel_dates = 1:8
+  vars_cur_z1 = vars_cur_z[2]
+  vars_cur_z_mean = paste(vars_cur_z, "mean", sep="_")
+  mods = map(vars_cur_z_mean, function(x) {
+    print(x)
+    map(post_rel_dates, function(y) {
+      print(y)
+    
+      cur1 = cur %>% filter(period=="PRE" | rel_date == y) %>%
+        group_by(bird, period, log.sirna2, labels) %>%
+        #sample_n(20) %>%
+        ungroup()
+      run_lmer_model(cur1, des, x)
+    }) %>% 
+      set_names(post_rel_dates) %>% 
+      bind_rows(.id="rel_date")
+  }) %>% 
+    set_names(vars_cur_z) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="period") %>%
+  group_by(variable) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() %>%
+  mutate(rel_date = as.numeric(rel_date))
+```
+
+```{r}
+plot_grouped3_across_time_with_sig2 = function(dat, value, sig_values) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none", "SLC17A6")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+
+  val = sub("_mean$", "", value)
+  print(val)
+  sig_value = sig_values %>% 
+    filter(variable==val)
+ # gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+   gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value_trim])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  
+  save_plot(file.path(group_dir, sprintf("%s_with_sig_baseline.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+
+value = "amp_mean_log2_z_mean"
+sig_values = mods_p %>% filter(sig)
+plot_grouped3_across_time_with_sig2(syls3, value, sig_values)
+
+```
+
+```{r}
+a = map(vars_cur_z_mean, ~plot_grouped3_across_time_with_sig2(syls3, .x, sig_values))
+```
+```{r}
+colors = c(CRH = "darkblue", CRHBP = "darkred", control = "black")
+plot_grouped3_across_time_with_sig2_no_legend = function(dat, value, sig_values) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none", "SLC17A6")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=log.sirna2)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)),
+                            alpha=.5)
+  gg = gg + geom_line(aes(color=log.sirna2, group=bird), alpha=.25)
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0),
+                  legend.position="none")
+
+  gg = gg + scale_color_manual(values=colors)
+  val = sub("_mean$", "", value)
+  print(val)
+  sig_value = sig_values %>% 
+    filter(variable==val)
+ # gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+   gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value_trim])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  
+  save_plot(file.path(group_dir, sprintf("%s_with_sig_baseline_no_legend.pdf", value)), gg, nrow=nrows, ncol=ndays + 1, base_height=2, base_width=.5)
+  print(gg)
+}
+
+
+value = "amp_mean_log2_z_mean"
+sig_values = mods_p %>% filter(sig)
+plot_grouped3_across_time_with_sig2_no_legend(syls3, value, sig_values)
+
+```
+
+```{r}
+a = map(vars_cur_z_mean, ~plot_grouped3_across_time_with_sig2_no_legend(syls3, .x, sig_values))
+```
+### Filter out poorly classified syllables
+```{r}
+plot_filter_dir = file.path(plot_dir, "pred_ent_filtered")
+dir.create(plot_filter_dir)
+```
+
+```{r}
+syls1_f = syls1 %>% filter(pred_ent < .5)
+```
+
+```{r}
+features_dir = file.path(plot_filter_dir, "features")
+dir.create(features_dir)
+```
+
+```{r}
+syls1_f = syls1_f %>% mutate(baseline = rel_date<=0)
+syls1_fa = syls1_f %>% group_by(bird, labels) %>%
+  do({
+    d = .
+    d  %>% mutate_at(vars_cur, list(z = "zscore_my"), baseline=d$baseline)
+     
+  })
+
+syls1_fa = syls1_fa %>% ungroup()
+```
+
+#### Grouped
+```{r}
+group_dir = file.path(plot_filter_dir, "grouped")
+dir.create(group_dir)
+```
+
+```{r}
+vars_cur_z = paste(vars_string, "z", sep="_")
+syls2 = syls1_fa %>% group_by(bird, labels, rel_date) %>% summarize_at(vars_cur_z, funs(mean, median, sd))
+syls2 = syls2 %>% left_join(info) %>% distinct(bird, rel_date, labels, .keep_all=T)
+```
+
+```{r}
+vars_form = c("Wiener entropy", "Syllable amplitude", "Syllable duration", "Spectral centroid", "Spectral spread", "Spectral skewness", "Spectral kurtosis", "Spectral slope", "Mean pitch", "Pitch goodness", "Delta spectral flatness", "Delta pitch", "Classification entropy",  "Wiener entropy (amplitude-corrected)", "Wiener entropy (amplitude-corrected)", "Pitch goodness (amplitude-corrected)", "Syllable duration (amplitude-corrected)", "Spectral spread (amplitude-corrected)")
+names(vars_form) = vars_cur_z
+```
+
+```{r}
+
+plot_grouped_across_time = function(syls2, value) {
+  print(value)
+  tmp = syls2 %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", sprintf("%s_mean", value), color="bird")) 
+  gg = gg + geom_point(position = position_jitter(width=.2))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + ylim(-4, 4)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+  print(gg)
+}
+map(vars_cur_z, ~plot_grouped_across_time(syls2, .x))
+```
+spectral slope is linear regression of normalized power spectrum. Indicates the general relative weightings of power bands, with higher values indicating more power at higher frequencies...
+
+```{r}
+
+plot_grouped_across_time_dodge = function(syls2, value) {
+  print(value)
+  tmp = syls2 %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna2 %in% c("none")))
+  gg = ggplot(tmp, aes_string("rel_date", sprintf("%s_mean", value), color="bird")) 
+  gg = gg + geom_point(position = position_jitterdodge(jitter.width=.1, dodge.width = .5))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + ylim(-4, 4)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s_dodge.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+  print(gg)
+}
+map(vars_cur_z, ~plot_grouped_across_time_dodge(syls2, .x))
+```
+```{r}
+vars_cur_z_mean = paste(vars_cur_z, "_mean", sep="")
+up = function(x,y) {x+y}
+low = function(x,y) {x-y}
+syls3 = syls2 %>% group_by(rel_date, bird, log.sirna2) %>% summarize_at(vars(vars_cur_z_mean), list(mean="mean_na", sem="sem_na", sd="sd_na")) 
+```
+
+
+```{r}
+plot_grouped3_across_time = function(dat, value) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 11) %>%
+    filter(!(log.sirna2 %in% c("none")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna2~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y="Z-score", title=vars_form[value_trim])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna2))
+  save_plot(file.path(group_dir, sprintf("%s.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=1.5, base_width=.75)
+  #return(gg)
+  print(gg)
+}
+value = "amp_mean_log2_z_mean"
+plot_grouped3_across_time(syls3, value)
+
+```
+
+```{r}
+map(vars_cur_z_mean, ~plot_grouped3_across_time(syls3, .x))
+```
+
+
+# PSDs
+```{r}
+psds_dir = file.path(prefix_data, "psds")
+dir.create(psds_dir)
+psds_plot_dir = file.path(plot_dir, "psds")
+dir.create(psds_plot_dir)
+```
+
+## Load subsampled, manually corrected songs
+```{r message=FALSE, warning=FALSE}
+options(httr_oob_default=TRUE)
+birds1 = c("rd23gr10", "wh20pk99", "or53or14", "or46pu99", "pu17bk34", "pu30bk80", "rd25gr70", "rd84gr50")
+dial_log = load_knockdown_gs(birds1)
+info_sub = map(birds1, ~load_song_info_event(.x, "songs/select", subdir="", log_data=dial_log, tz="PDT")) %>%
+ bind_rows()
+info_sub = info_sub %>% distinct(wav, .keep_all=T)
+```
+
+## Metadata cleanup
+```{r}
+info_sub = info_sub %>% mutate(period = if_else(rel_date<=0, "PRE", "POST"))
+info_sub = info_sub %>% mutate(wav_base = basename(wav),
+                        mat_base = basename(mat))
+## Remove double backslashes
+info_sub = info_sub %>% mutate(wav = gsub("\\/\\/", "\\/", wav))
+
+```
+
+
+```{r}
+#label = "d"
+
+min_date = -4
+max_date = 8
+redo = F
+drop = F
+wl = 512
+fs = 44100
+window = wl / fs
+
+#psds = lapply(1:nrow(params), function(k) {
+#  params_cur = params[k,]
+#  label = params_cur$label
+#  lbuffer = params_cur$lbuffer
+#  rbuffer = params_cur$rbuffer
+#print(label)
+ fname = paste(data_dir, "psds.rds", sep="/")
+ tname = "psds"
+ nsongs = 5
+ info1 = info_sub %>% 
+   #filter(bird %in% c("wh20pk99", "or53or14")) %>% 
+   filter(rel_date >= min_date, rel_date <= max_date)
+   #group_by(bird, rel_date) %>% filter(n() >= nsongs) %>% sample_n(nsongs)
+ 
+ #info1 = info1[1:1000,]
+if (redo) {
+  if (drop && db_has_table(db$con, tname))
+    db_drop_table(db$con, tname)
+  psds1 = calc_psd_average_batch(info1, wl=wl, data_db=db,tname=tname, return_df=T, replace_data = T)
+  saveRDS(psds1, fname)
+} else {
+  psds1 = readRDS(fname)
+}
+```
+
+```{r}
+audio_input= "wav"
+mats = load_mat_batch(info1, 
+                      #data_db=db,
+                      #tname=tname,
+                      replace_data=F,
+                      #index_cols=c("labels", "mat"),
+                      #addl_filters=list(c("labels", label)),
+                      parallel=F,
+                      audio_input=audio_input)
+
+psds2 = psds1 %>% left_join(mats, by="id") %>%
+  left_join(info1, by="mat")
+
+psds2 = psds2 %>% mutate(condition = log.sirna2)
+#psds2 = psds2 %>% left_join(syls1 %>% select(onsets, offsets, labels, bird, pred_ent))
+
+#psds2 = psds2 %>% filter(pred_ent < .5)
+```
+
+
+## Load deafening data
+```{r}
+psds_deaf_dir = file.path("~/data2/rstudio/birds/deafen/song_analysis/figures/psds")
+psds1_deaf = readRDS(file.path(psds_deaf_dir, "psds.rds"))
+db_deaf = src_sqlite("~/data2/rstudio/birds/deafen/song_analysis/aggregate_data.db")
+
+info_deaf = collect(tbl(db_deaf, "song_info"), n=Inf)
+
+audio_input= "wav"
+mats_deaf = load_mat_batch(info_deaf, 
+                      replace_data=F,
+                      parallel=F,
+                      audio_input=audio_input)
+
+
+
+mats = bind_rows(mats, mats_deaf)
+
+psds2_deaf = psds1_deaf %>% left_join(mats_deaf, by="id") %>%
+  left_join(info_deaf, by="mat")
+psds2_deaf = psds2_deaf %>%
+  filter(Duration.of.experiment=="14") 
+```
+
+```{r}
+cnames = intersect(colnames(psds2), colnames(psds2_deaf))
+cnames = cnames[!(cnames %in% c("date", "mtime", "time_h", "date_noon"))]
+psds2 = bind_rows(psds2 %>% select(one_of(cnames)), psds2_deaf %>% select(one_of(cnames)))
+
+info1 = info1 %>% mutate(condition = log.sirna)
+cnames = intersect(colnames(info1), colnames(info_deaf))
+cnames = cnames[!(cnames %in% c("date", "mtime", "time_h", "date_noon"))]
+
+
+info1 = bind_rows(info1 %>% select(one_of(cnames)), info_deaf %>% select(one_of(cnames)))
+```
+
+```{r}
+psds2 = psds2 %>% group_by(id) %>% mutate(psd_norm = scale_01(power),
+                                          psd_prob = power / sum(power))
+```
+
+```{r}
+psds2_base = psds2 %>% filter(rel_date <= 0) %>% group_by(bird, labels, freq) %>% 
+  summarize(power_base = mean(power),
+            psd_norm_base = mean(psd_norm),
+            prob_base = mean(psd_prob))
+psds2 = psds2 %>% left_join(psds2_base)
+```
+
+## Example PSDs
+```{r}
+ex_bird = c("wh20pk99", "or53or14")
+ex_label = "b"
+
+psds2_ex = psds2 %>% filter(bird %in% ex_bird, labels == ex_label) %>%
+  distinct(id, bird, rel_date, freq, .keep_all=T) %>%
+  filter(rel_date %in% c("-1", "3")) %>%
+  group_by(rel_date, freq, bird) %>% 
+  summarize(power = mean(power),
+            psd_prob = mean(psd_prob)) 
+
+psds2_ex_dist = psds2_ex %>% ungroup() %>% group_by(bird)  %>% summarize(kl = calc_kl(psd_prob[rel_date==3], psd_prob[rel_date==-1])) 
+#psds2_ex = psds2 %>% filter(id %in% id_ex$id)
+```
+
+```{r}
+psds2_ex_dist = psds2_ex_dist %>% mutate(x=3,y=.3, rel_date=3, label = sprintf("KL distance = %s", round(kl, 2) ))
+
+gg = ggplot(psds2_ex, aes(freq, psd_prob))
+gg = gg + geom_line()
+gg = gg + facet_grid(bird~rel_date)
+gg = gg + xlim(0,10)
+gg = gg + labs(x="Hz", y="density")
+gg = gg + theme(strip.text=element_blank())
+gg = gg + geom_text(data=psds2_ex_dist, aes(x=x, y=y, label=label), inherit.aes = F, color="darkblue", size=6)
+gg
+```
+
+
+
+## Calc distances
+```{r}
+calc_scaled_sim = function(s, w) {
+  (w - s) / (1 + w + s + w*s)
+}
+```
+
+```{r}
+psds3 = psds2 %>% 
+  filter(!(labels %in% c("n", "i"))) %>% 
+  group_by(bird, id, labels) %>% summarize(power_kl = calc_kl(power, power_base),
+                                           power_uni = calc_kl(power, rep(1/n(), times=n())),
+                                           psd_norm_kl = calc_kl(psd_norm, psd_norm_base),
+                                           prob_kl = calc_kl(psd_prob, prob_base),
+                                           prob_uni = calc_kl(psd_prob, rep(1/n(), times=n()))) %>% left_join(mats) %>% left_join(info1)
+
+test = psds3 %>% left_join(info1)
+
+psds3n = psds2 %>%
+  filter(labels == "n") %>%
+  group_by(bird, id) %>% do({
+    d = .
+    d1 = d %>% select(freq, power, psd_prob)
+    dbase = psds2_base %>% filter(bird==d$bird[1]) %>%
+      select(bird, labels, freq, power_base, prob_base)
+    dbase %>% left_join(d1, by="freq") %>%
+      group_by(labels) %>%
+      summarize(power_kl1 = calc_kl(power, power_base),
+                power_uni1 = calc_kl(power, rep(1/n(), times=n())),
+                prob_kl1 = calc_kl(psd_prob, prob_base),
+                prob_uni1 = calc_kl(psd_prob, rep(1/n(), times=n()))) %>%
+      ungroup() %>%
+      summarize(power_kl = median(power_kl1),
+                power_uni = median(power_uni1),
+                prob_kl = median(prob_kl1),
+                prob_uni = median(prob_uni1)) %>%
+      mutate(labels="n")
+    
+  }) %>% left_join(mats) %>% left_join(info1)
+
+
+psds3 = bind_rows(psds3, psds3n)
+
+psds3 = psds3 %>% mutate(power_ss = calc_scaled_sim(power_kl, power_uni),
+                         prob_ss = calc_scaled_sim(prob_kl, prob_uni))
+
+psds3 = psds3 %>% mutate(period = if_else(rel_date<=0, "PRE", "POST"),
+                         period = factor(period, levels=c("PRE","POST")))
+psds3 = psds3 %>% 
+  mutate(baseline = rel_date<=0) %>% 
+  group_by(bird, labels)  %>% do({
+    d = .
+    d = d %>% mutate_at(vars(power_kl, psd_norm_kl, power_uni, prob_kl, prob_uni, power_ss, prob_ss), 
+                        list(z = "zscore_my",
+                             perc = "perc_change"), baseline=d$baseline)
+  })
+
+
+psds4 = psds3 %>% group_by(bird, rel_date, labels) %>%
+  summarize_at(vars(power_kl, psd_norm_kl, power_kl_z, power_kl_perc, psd_norm_kl_z, power_uni_z, power_ss_z, prob_kl_z, prob_uni_z, prob_ss_z), 
+               list(mean = "mean_na", sd = "sd_na", var = "var_na", cv = "calc_cv"))
+
+psds4 = psds4 %>%
+  mutate(baseline = rel_date<=0) %>% 
+  group_by(bird, labels)  %>% do({
+    d = .
+    d = d %>% mutate_at(vars(power_kl_var, power_kl_sd, power_kl_cv), 
+                        list(z = "zscore_my",
+                             perc = "perc_change"), baseline=d$baseline)
+  })
+  
+psds3_vars = vars(power_kl_z, psd_norm_kl_z,power_uni_z,
+                    power_ss,
+                    prob_ss_z,
+                    prob_kl_z,
+                    prob_uni_z,
+                  prob_ss,
+                  prob_uni)
+psds4_vars = vars(power_kl_z_mean, psd_norm_kl_z_mean, power_kl_var_z, power_kl_cv_z, power_uni_z_mean,
+                    power_ss_z_mean,
+                    prob_ss_z_mean,
+                    prob_kl_z_mean,
+                    prob_uni_z_mean)
+psds5 = psds4 %>% 
+  group_by(bird, rel_date) %>% 
+  summarize_at(psds4_vars, list(mean="mean_na", sd = "sd_na", median = "median_na", iqr = "iqr")) %>%
+  left_join(info1)
+
+psds4_max = psds4 %>% 
+  group_by(bird, labels) %>% 
+  summarize(mean_val = mean(power_kl_z_mean)) %>% top_n(3, mean_val)
+
+psds5_top = psds4 %>% 
+  inner_join(psds4_max) %>% 
+  group_by(bird, rel_date) %>% 
+  summarize_at(psds4_vars, list(mean="mean_na", sd = "sd_na", median="median_na", iqr = "iqr")) %>%
+  left_join(info1)
+
+psds4_ent_top = psds2_base %>% 
+  group_by(bird, labels) %>%
+  summarize_at(vars(power_base, prob_base), list(went = calc_wiener_entropy)) %>%
+  top_n(-3, prob_base_went)
+
+psds5_ent_top = psds4 %>% 
+  inner_join(psds4_ent_top) %>% 
+  group_by(bird, rel_date) %>% 
+  summarize_at(psds4_vars, list(mean="mean_na", sd = "sd_na", median="median_na", iqr = "iqr")) %>%
+  left_join(info1)
+
+
+psds5n =  psds4 %>% 
+  filter(labels=="n") %>% 
+  group_by(bird, rel_date) %>% 
+  summarize_at(psds4_vars, list(mean="mean_na", sd = "sd_na", median="median_na", iqr = "iqr")) %>%
+  left_join(info1)
+
+psds5_all = psds3 %>%
+  group_by(bird, rel_date) %>% 
+    summarize_at(psds3_vars, list(mean="mean_na", sd = "sd_na", median="median_na", iqr = "iqr")) %>%
+  left_join(info1)
+
+psds5_all_non = psds3 %>%
+  filter(labels!="n") %>% 
+  group_by(bird, rel_date) %>% 
+    summarize_at(psds3_vars, list(mean="mean_na", sd = "sd_na", median="median_na", iqr = "iqr")) %>%
+  left_join(info1)
+```
+
+## Plotting
+
+```{r fig.height=8}
+gg = ggplot(psds4, aes(rel_date, power_kl_z_mean, color=labels))
+gg = gg + geom_pointrange(aes(ymin=(power_kl_z_mean-power_kl_z_sd), ymax=(power_kl_z_mean+power_kl_z_sd)))
+gg = gg + facet_wrap(~bird)
+gg = gg + ylim(-2, 10)
+gg
+
+gg = ggplot(psds5, aes(rel_date, power_kl_z_mean_mean, color=bird))
+gg = gg + geom_pointrange(aes(ymin=(power_kl_z_mean_mean-power_kl_z_mean_sd), ymax=(power_kl_z_mean_mean + power_kl_z_mean_sd)))
+gg = gg + geom_line(aes(group=bird))
+gg = gg + facet_grid(condition~.)
+#gg = gg + ylim(-2, )
+gg
+
+gg = ggplot(psds5, aes(rel_date, power_kl_var_z_mean, color=bird))
+gg = gg + geom_point()
+#gg = gg + geom_pointrange(aes(ymin=(power_kl_z_mean_mean-power_kl_z_mean_sd), ymax=(power_kl_z_mean_mean + power_kl_z_mean_sd)))
+gg = gg + geom_line(aes(group=bird))
+gg = gg + facet_grid(log.sirna~.)
+#gg = gg + ylim(-2, )
+gg
+
+gg = ggplot(psds5, aes(rel_date, power_kl_cv_z_mean, color=bird))
+gg = gg + geom_point()
+#gg = gg + geom_pointrange(aes(ymin=(power_kl_z_mean_mean-power_kl_z_mean_sd), ymax=(power_kl_z_mean_mean + power_kl_z_mean_sd)))
+gg = gg + geom_line(aes(group=bird))
+gg = gg + facet_grid(log.sirna~.)
+#gg = gg + ylim(-2, )
+gg
+
+
+
+gg = ggplot(psds5_top, aes(rel_date, power_kl_z_mean_mean, color=bird))
+gg = gg + geom_pointrange(aes(ymin=(power_kl_z_mean_mean-power_kl_z_mean_sd), ymax=(power_kl_z_mean_mean + power_kl_z_mean_sd)))
+gg = gg + geom_line(aes(group=bird))
+gg = gg + facet_grid(log.sirna~.)
+#gg = gg + ylim(-2, )
+gg = gg + geom_hline(yintercept=0, linetype=2)
+gg
+
+```
+```{r}
+vars_form = c("PSD KL distance mean", "PSD KL distance CV", "PSD KL distance mean")
+values = c("power_kl_z", "power_kl_cv_z", "prob_kl_z")
+names(vars_form) = values
+plot_grouped3_across_time = function(dat, value, suffix) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(condition %in% c("none"))) %>%
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) #%>%
+    #mutate(experiment = if_else(condition %in% c("intact", "deaf"), "deafening", "knockdown")) %>%
+    #mutate(experiment = factor(experiment, levels=c("deafening", "knockdown")))
+  
+  manips = data.frame(manipulation = c("control", "treatment", "treatment", "control", "treatment"),
+                      condition = c("control", "CRHBP", "CRH", "intact", "deaf"),
+                      experiment = c("CRHBP knockdown", "CRHBP knockdown", "CRH knockdown", "deafening", "deafening"))
+  
+  tmp = tmp %>% left_join(manips)
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(manipulation~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$manipulation))
+  nrows = length(unique(tmp$experiment))
+ # save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=2, base_width=3)
+  print(gg)
+  
+  gg = ggplot(tmp, aes(rel_date, value_mean)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)), alpha=.5)
+  gg = gg + geom_line(alpha=.5)
+  gg = gg + facet_grid(manipulation~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$manipulation))
+  nrows = length(unique(tmp$experiment))
+  #save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s_nobirds.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=2, base_width=3)
+  print(gg)
+  
+  
+}
+
+values = c("power_kl_z_mean", "prob_kl_z_mean")
+walk(values, ~plot_grouped3_across_time(psds5, .x, "by_syl"))
+walk(values, ~plot_grouped3_across_time(psds5_top, .x, "top3"))
+walk(values, ~plot_grouped3_across_time(psds5_ent_top, .x, "top3_ent"))
+
+
+walk(values, ~plot_grouped3_across_time(psds5_all, sub("_mean", "", .x), "all"))
+
+
+
+```
+
+```{r}
+psds5_vars = vars(power_kl_z_mean_mean, psd_norm_kl_z_mean_mean, power_kl_var_z_mean, power_kl_cv_z_mean, power_uni_z_mean_mean,
+                    power_ss_z_mean_mean,
+                    prob_ss_z_mean_mean,
+                    prob_kl_z_mean_mean,
+                    prob_uni_z_mean_mean)
+psds6 = psds5 %>% group_by(condition, rel_date) %>%
+  summarize_at(psds5_vars, list(mean = "mean_na", sd = "sd_na", sem = "sem")) %>% 
+  left_join(info1) %>% 
+  ungroup()
+
+psds6_top = psds5_top %>% group_by(condition, rel_date) %>%
+  summarize_at(psds5_vars, list(mean = "mean_na", sd = "sd_na", sem = "sem")) %>% 
+  left_join(info1) %>% 
+  ungroup()
+
+```
+
+```{r}
+vars_form = c("PSD KL distance mean", "PSD KL distance CV", "PSD KL distance mean")
+values = c("power_kl_z_mean", "power_kl_cv_z_mean", "prob_kl_z_mean")
+names(vars_form) = values
+plot_grouped6_across_time = function(dat, value, suffix) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(condition %in% c("none"))) %>%
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) #%>%
+    #mutate(experiment = if_else(condition %in% c("intact", "deaf"), "deafening", "knockdown")) %>%
+    #mutate(experiment = factor(experiment, levels=c("deafening", "knockdown")))
+  
+  manips = data.frame(manipulation = c("control", "treatment", "treatment", "control", "treatment"),
+                      condition = c("control", "CRHBP", "CRH", "intact", "deaf"),
+                      experiment = c("CRHBP knockdown", "CRHBP knockdown", "CRH knockdown", "deafening", "deafening"))
+  
+  tmp = tmp %>% left_join(manips)
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sem", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line()
+  gg = gg + facet_grid(manipulation~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$manipulation))
+  nrows = length(unique(tmp$experiment))
+  save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=2, base_width=3)
+  print(gg)
+  
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(condition %in% c("none"))) %>%
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) #%>%
+  #mutate(experiment = if_else(condition %in% c("intact", "deaf"), "deafening", "knockdown")) %>%
+  #mutate(experiment = factor(experiment, levels=c("deafening", "knockdown")))
+  
+  manips = data.frame(manipulation = c("control", "treatment", "treatment", "control", "treatment"),
+                      condition = c("control", "CRHBP", "CRH", "intact", "deaf"),
+                      experiment = c("knockdown", "knockdown", "knockdown", "deafening", "deafening"))
+  
+  tmp = tmp %>% left_join(manips)
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+  
+  
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=condition)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=condition))
+  gg = gg + facet_grid(.~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  
+  colors = c("grey40", "darkred", "grey40", "navy", "darkgreen" )
+  names(colors) = c("intact", "deaf", "control", "CRH", "CRHBP")
+  gg = gg + scale_color_manual("", values=colors)
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$experiment))
+  nrows = 1
+  save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s_combined.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=4, base_width=3)
+  print(gg)
+  
+}
+values = c( "prob_kl_z_mean_mean")
+walk(values, ~plot_grouped6_across_time(psds6, .x, "by_condition"))
+walk(values, ~plot_grouped6_across_time(psds6_top, .x, "by_condition_top"))
+```
+
+## Significance testing relative to control
+```{r}
+run_anova_group = function(model) {
+  #res_tidy = tidy(model, effects = c("fixed"))
+  an = Anova(model, type = "II", test.statistic = "Chisq")
+  an = as.data.frame(an) %>% 
+    rownames_to_column(var="term") %>%
+    rename(p.value = `Pr(>Chisq)`,
+           statistic = Chisq) %>%
+    dplyr::select(-Df)
+  an = an[1,]
+  #res_tidy = bind_rows(res_tidy, an)
+  #res_tidy
+  an
+}
+run_effects = function(model, ind=1) {
+  eff = allEffects(model, residuals=F)
+  df = as.data.frame(eff[[ind]])
+  #df$fit = as.numeric(df$fit)
+  #df$lower = as.numeric(df$lower)
+  #df$upper = as.numeric(df$upper)
+  df
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+redo = T
+
+min_date = -4
+max_date = 8
+fname = file.path(psds_plot_dir, "relative_to_control.rds")
+if (redo) {
+  run_lmer_model = function(dat, des, value) {
+    rename_func = function(x) "value"
+    
+    tmp = dat %>% ungroup() %>%
+      rename_at(vars(matches(value)), rename_func)
+    
+    tmp %>% 
+    #  group_by(experiment) %>%
+      do({
+        d = .
+        mod = lmer(des, d,  lmerControl(optimizer ="Nelder_Mead"), REML=F)
+        coefs = extract_coefs(mod)
+        mod_an = run_anova_group(mod)
+        mod_an_m = melt(mod_an) %>%
+          rename(coef = term,
+                 coef_type = variable) %>%
+          mutate(level = "anova")
+        coefs = bind_rows(coefs, mod_an_m)
+        coefs
+      })
+  }
+  
+  nsyl_min = 100
+  nsyls = psds3 %>% group_by(bird, rel_date, condition, labels) %>% summarize(n=n())
+  nsyls = nsyls %>% filter(n>nsyl_min)
+  cur = psds3 %>% 
+    filter(rel_date>=min_date, rel_date <= max_date) %>%
+    mutate(condition = factor(condition)) %>%
+    inner_join(nsyls) %>%
+    inner_join(psds4_max) %>% 
+    #filter(rel_date == 3) #%>%
+    # filter(labels %in% c("a", "b")) %>%
+    #filter(%in% c("control", "CRHBP (1-3)"))
+ungroup()
+  
+  des = value ~ condition + (1 + condition  | bird / labels)
+  post_rel_dates = 1:8
+  values1 = c("prob_kl_z")
+  conditions = list(c("intact", "deaf"), c("control", "CRHBP (1-3)"))
+  mods = map(values1, function(x) {
+    print(x)
+    map(post_rel_dates, function(y) {
+      print(y)
+      cur1 = cur %>% filter(rel_date == y) %>%
+        group_by(bird, period, condition, labels) %>%
+        sample_n(nsyl_min) %>%
+        ungroup()
+      
+      map_dfr(conditions, function(con) {
+        print(con)
+        map(2:length(con), function(i) {
+          print(i)
+          cur2 = cur1 %>% filter(condition %in% c(con[1], con[i])) %>% 
+            droplevels()
+          if (length(unique(cur2$condition))<2)
+            return(data.frame())
+          run_lmer_model(cur2, des, x)
+        }) %>% set_names(con[2:length(con)]) %>% bind_rows(.id = "condition")
+      })
+     
+    }) %>% 
+      set_names(post_rel_dates) %>% 
+      bind_rows(.id="rel_date")
+  }) %>% 
+    set_names(values1) %>%
+    bind_rows(.id="variable")
+  
+  
+  saveRDS(mods, fname)
+} else {
+  mods = readRDS(fname)
+}
+```
+
+```{r}
+mods_p = mods %>% filter(level=="anova") %>% filter(coef_type=="p.value", coef=="condition") %>%
+  group_by(variable, condition) %>% 
+  mutate(padj = p.adjust(value, method = "BH")) %>%
+  mutate(sig = padj<.05) %>%
+  ungroup() %>%
+  mutate(rel_date = as.numeric(rel_date))
+```
+
+```{r}
+vars_form = c("PSD KL distance mean", "PSD KL distance CV", "PSD KL distance mean")
+values = c("power_kl_z_mean", "power_kl_cv_z_mean", "prob_kl_z_mean")
+names(vars_form) = values
+plot_grouped6_across_time_with_sig = function(dat, value, suffix, sig_values) {
+  print(value)
+  #value_quo = enquo(value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(condition %in% c("none"))) %>%
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) #%>%
+    #mutate(experiment = if_else(condition %in% c("intact", "deaf"), "deafening", "knockdown")) %>%
+    #mutate(experiment = factor(experiment, levels=c("deafening", "knockdown")))
+  
+  manips = data.frame(manipulation = c("control", "treatment", "treatment", "control", "treatment"),
+                      condition = c("control", "CRHBP", "CRH", "intact", "deaf"),
+                      experiment = c("CRHBP knockdown", "CRHBP knockdown", "CRH knockdown", "deafening", "deafening"))
+  
+  tmp = tmp %>% left_join(manips)
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sem", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line()
+  gg = gg + facet_grid(manipulation~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$manipulation))
+  nrows = length(unique(tmp$experiment))
+  save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=2, base_width=3)
+  print(gg)
+  
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(condition %in% c("none"))) %>%
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) #%>%
+  #mutate(experiment = if_else(condition %in% c("intact", "deaf"), "deafening", "knockdown")) %>%
+  #mutate(experiment = factor(experiment, levels=c("deafening", "knockdown")))
+  
+  sig_values = sig_values %>%  
+    mutate(condition = factor(condition, levels = c("control", "CRHBP (1-3)", "CRH (set1)", "intact", "deaf"),
+                              labels = c("control", "CRHBP", "CRH", "intact", "deaf"))) 
+  manips = data.frame(manipulation = c("control", "treatment", "treatment", "control", "treatment"),
+                      condition = c("control", "CRHBP", "CRH", "intact", "deaf"),
+                      experiment = c("knockdown", "knockdown", "knockdown", "deafening", "deafening"))
+  
+  tmp = tmp %>% left_join(manips)
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+  
+  tmp = tmp %>% mutate(value_error = if_else(is.na(value_error), 0, value_error))
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=condition)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=condition))
+  gg = gg + facet_grid(.~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  
+  colors = c("grey40", "darkred", "grey40", "navy", "darkgreen" )
+  names(colors) = c("intact", "deaf", "control", "CRH", "CRHBP")
+  gg = gg + scale_color_manual("", values=colors)
+  
+  sig_value = sig_values %>%
+    left_join(manips) %>%
+    filter(sig)
+  # gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean, na.rm=T)+1, aes(x=rel_date, color=condition), inherit.aes = F, pch=8)
+  gg = gg + ylim(-.5,max(tmp$value_mean+1.5))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$experiment))
+  nrows = 1
+  save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s_combined.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=4, base_width=3)
+  print(gg)
+  
+  tmp = tmp %>% filter(condition!="CRH")
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=condition)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=condition))
+  gg = gg + facet_grid(.~experiment)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+  
+  colors = c("grey40", "darkred", "grey40", "navy", "darkgreen" )
+  names(colors) = c("intact", "deaf", "control", "CRH", "CRHBP")
+  gg = gg + scale_color_manual("", values=colors)
+  
+  sig_value = sig_values %>%
+    left_join(manips) %>%
+    filter(sig)
+  # gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean, na.rm=T)+1, aes(x=rel_date, color=condition), inherit.aes = F, pch=8)
+  gg = gg + ylim(-.5,max(tmp$value_mean+1.5))
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to procedure", y="Z-score", title=vars_form[value_trim])
+  ncols = length(unique(tmp$experiment))
+  nrows = 1
+  save_plot(file.path(psds_plot_dir, sprintf("with_deaf_%s_%s_combined_no_crh.pdf", value, suffix)), gg, nrow=nrows, ncol=ncols + 2, base_height=4, base_width=3)
+  print(gg)
+  
+}
+
+values = c( "prob_kl_z_mean_mean")
+walk(values, ~plot_grouped6_across_time_with_sig(psds6, .x, "by_condition_with_sig", mods_p))
+walk(values, ~plot_grouped6_across_time_with_sig(psds6_top, .x, "by_condition_top_with_sig", mods_p))
+```
+
+```{r}
+plot_grouped3_across_time_with_sig2 = function(dat, value, sig_values) {
+  print(value)
+  #value_quo = enquo(value)
+    values_form_cur = values_form %>% filter(val == value)
+  tmp = dat %>% filter(rel_date > -4, rel_date <= 8) %>%
+    filter(!(log.sirna %in% c("none")))
+  
+  value_mean = sprintf("%s_mean", value)
+  value_error = sprintf("%s_sd", value)
+
+  rename_mean_func = function(x) "value_mean"
+  rename_error_func = function(x) "value_error"
+  
+  tmp = tmp %>% ungroup() %>%
+    rename_at(vars(matches(value_mean)), rename_mean_func) %>%
+    rename_at(vars(matches(value_error)), rename_error_func)
+
+  gg = ggplot(tmp, aes(rel_date, value_mean, color=bird)) 
+  gg = gg + geom_pointrange(aes(ymin=(value_mean-value_error),
+                                ymax=(value_mean+value_error)))
+  gg = gg + geom_line(aes(color=bird))
+  gg = gg + facet_grid(log.sirna~.)
+  gg = gg + geom_hline(yintercept=0, linetype=2) 
+  gg = gg + geom_vline(xintercept=0, linetype=3)
+  gg = gg + theme_cowplot()
+  gg = gg + theme(strip.text.y = element_text(angle = 0))
+
+  val = sub("_mean$", "", value)
+  print(val)
+  sig_value = sig_values %>% 
+    filter(variable==sub("_mean", "", val))
+ # gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+   gg = gg + geom_point(data=sig_value, y = max(tmp$value_mean, na.rm=T)*1.5, aes(x=rel_date), inherit.aes = F, pch=8)
+  value_trim = sub("_mean$", "", value)
+  gg = gg + labs(x="days relative to siRNA transfection", y=values_form_cur$ylab[1], title=values_form_cur$title[1])
+  ndays = length(unique(tmp$rel_date))
+  nrows = length(unique(tmp$log.sirna))
+  
+  save_plot(file.path(freq_dir, sprintf("%s_with_sig_baseline.pdf", value)), gg, nrow=nrows, ncol=ndays + 2, base_height=2, base_width=.5)
+  print(gg)
+}
+
+value = "ff_mean_z"
+sig_values = mods_p %>% filter(sig)
+plot_grouped3_across_time_with_sig2(ffreq3, value, sig_values)
+
+```
+```{r}
+
+a = map(values, ~plot_grouped3_across_time_with_sig2(ffreq3, .x, sig_values))
+```
+
+```{r}
+library(NMF)
+#anno = ungroup(psds2) %>% mutate(time = as.numeric(mtime)) %>% select(time)
+par(mfrow=c(1,1))
+br = seq(0, 1, .05)
+br = c(0, seq(.6, 1, .01))
+tmp = psds2 %>% filter(freq<8)
+for (l in unique(psds2$labels)) {
+psds2_s = acast(tmp %>% filter(labels==l), freq~id, value.var = "psd_norm")
+aheatmap(psds2_s[nrow(psds2_s):1,], Colv=NA, Rowv=NA, revC=T, breaks=br, color = sprintf("Blues:%s", length(br)+1))
+}
+```
+
+```{r}
+plot_psd_across_id = function(data, x_value="id", y_value="freq", fill_value="psd_norm", facet_factor="expt") {
+  gg = ggplot(data, aes_string(x_value, y_value, fill = fill_value))
+  gg = gg + geom_raster(interpolate = T)
+  
+  ## Added shaded sections -------------------------------------------------
+  data_un = data %>% distinct(drug_start, drug_stop, .keep_all=T) %>%
+    filter(!is.na(drug_start))
+  gg = gg + geom_rect(data = data_un,
+                      aes(xmin=id_drug_start,
+                          xmax=id_drug_stop),
+                      ymin = -Inf,
+                      ymax = Inf,
+                      fill=NA,
+                      color="grey",
+                      alpha=.5)
+  ## Split by facet_factor ------------------------------------------------------------
+  gg = gg + facet_wrap(as.formula(paste("~", facet_factor, sep="")), scales="free")
+  gg = gg + scale_fill_gradient(low = "white", high="darkblue", limits=c(.4, 1) )
+  gg = gg + ylim(0,8)
+  gg = gg + theme_bw()
+  gg = gg + theme(axis.text.x = element_text(angle=45, hjust=1),
+                  panel.grid.major.x=element_line(linetype=3, color="grey"))
+  gg
+}
+```
+
+```{r}
+expts = c("PBS-control (1)", "10 uM CRH", "10 uM CRH(6-33)", "4 mM AP5", "10 uM CRH/10 uM CRH(6-33)")
+data = psds2 %>% filter(expt %in% expts )
+
+ids = psds2 %>% distinct(id, labels, expt) %>%
+  group_by(labels, expt) %>%
+  mutate(rel_id = 1:length(id))
+data = data %>% left_join(ids)
+data = data %>% group_by(expt) %>% mutate(id_drug_start = rel_id[rel_mtime>=rel_drug_start][1],
+                                          id_drug_stop = rel_id[rel_mtime>=rel_drug_stop][1])
+
+data_ff = ffreq1 %>% left_join(ids)
+data_ff = data_ff %>% group_by(expt) %>% mutate(id_drug_start = rel_id[rel_mtime>=rel_drug_start][1],
+                                          id_drug_stop = rel_id[rel_mtime>=rel_drug_stop][1])
+
+x_value = "rel_id"
+y_value = "freq"
+fill_value = "psd_norm"
+facet_factor = "expt"
+
+labels = unique(data$labels)
+
+for (l in labels) {
+  print(l)
+  tmp = data %>% filter(labels==l)
+  tmp = tmp %>% filter(rel_id > (id_drug_start) - 100,
+                       rel_id < (id_drug_stop) + 100)
+  gg = plot_psd_across_id(tmp, x_value=x_value, y_value=y_value, fill_value=fill_value,
+                     facet_factor=facet_factor)
+  gg = gg + labs(title=l)
+  gg = gg + ylim(2, 5)
+  
+  tmp_ff = data_ff %>% 
+    filter(labels==l) %>% 
+    filter(expt %in% expts) %>% 
+    filter(rel_id > (id_drug_start) - 100,
+           rel_id < (id_drug_stop) + 100) %>%
+    mutate(psd_norm = 1)
+  gg = gg + geom_line(data=tmp_ff, aes_string(x_value, "ff"), color="red")
+  print(gg)
+}
+```
+
+```{r}
+gg = ggplot(psds1 %>% filter(labels=="d"), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_xwent_mean, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="r") %>%
+              filter(grepl("CRH", expt)), aes(rel_mtime, psd_norm_went, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
+
+
+```{r}
+gg = ggplot(psds1 %>% 
+              filter(labels=="d") %>%
+              filter(grepl("CRH|PBS|probe", expt)), aes(rel_mtime, psd_norm_went_z, color=log.drug))
+gg = gg + geom_point(alpha=.1)
+gg = gg + scale_color_manual(values=colors)
+gg = gg + facet_wrap(~expt, scales="free_x")
+gg = gg + xlim(-5, 8) + ylim(-6,6)
+gg = gg + stat_smooth(se=F, fullrange=F, span=1, method="loess")
+gg
+```
